@@ -1,0 +1,112 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ${PROJECT_NAME:-rag}_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rag_mvp}
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag_mvp}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - rag_network
+    profiles:
+      - dev
+      - full
+
+  backend:
+    # 使用你之前构建好的镜像名
+    image: backend:latest
+    container_name: ${PROJECT_NAME:-rag}_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_NAME: ${APP_NAME:-RAG Web MVP}
+      APP_ENV: ${APP_ENV:-production}
+      SECRET_KEY: ${SECRET_KEY:-replace_me_in_prod}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-120}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-rag}@postgres:5432/${POSTGRES_DB:-rag_mvp}
+      STORAGE_ROOT: /app/data
+      KB_SYNC_ROOT: /app/data/knowledge
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:5173"]}'
+      DEFAULT_ADMIN_USERNAME: ${DEFAULT_ADMIN_USERNAME:-admin}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123456}
+      DEFAULT_EMBEDDING_DIM: ${DEFAULT_EMBEDDING_DIM:-1536}
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-local}
+      EMBEDDING_PROVIDER_TYPE: ${EMBEDDING_PROVIDER_TYPE:-openai_compatible}
+      EMBEDDING_ENDPOINT_URL: ${EMBEDDING_ENDPOINT_URL:-}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-m3}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_LOCAL_DEVICE: ${EMBEDDING_LOCAL_DEVICE:-auto}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-16}
+      EMBEDDING_FALLBACK_HASH: ${EMBEDDING_FALLBACK_HASH:-true}
+      HF_HOME: /root/.cache/huggingface
+      # 强制离线模式，避免尝试连接 HuggingFace
+      HF_HUB_OFFLINE: 1
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'python',
+          '-c',
+          'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5)',
+        ]
+      interval: 15s
+      timeout: 6s
+      retries: 10
+    volumes:
+      - backend_data:/app/data
+      # 关键：挂载宿主机的模型目录
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    networks:
+      - rag_network
+    profiles:
+      - full
+
+  frontend:
+    image: rag-frontend:latest
+    container_name: ${PROJECT_NAME:-rag}_frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - rag_network
+    profiles:
+      - full
+
+  nginx:
+    image: nginx:alpine
+    container_name: ${PROJECT_NAME:-rag}_nginx
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - backend
+    ports:
+      - '${FRONTEND_PORT:-80}:80'
+    volumes:
+      # 挂载当前目录下的 nginx.conf
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - rag_network
+    profiles:
+      - full
+
+volumes:
+  postgres_data:
+  backend_data:
+  # hf_cache:  <-- 移除这个，改用宿主机挂载
+
+networks:
+  rag_network:
