@@ -187,7 +187,7 @@ EMBEDDING_FALLBACK_HASH=false
 查看容器状态：
 
 ```bash
-docker compose --env-file deploy/.env.server ps
+docker compose --env-file deploy/.env.server -f deploy/docker-compose.yml ps
 ```
 
 查看后端健康检查：

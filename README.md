@@ -14,12 +14,16 @@
 ├── frontend/
 │   ├── src/
 │   └── Dockerfile
+├── deploy/
+│   ├── docker-compose.yml
+│   ├── .env.server.example
+│   └── up.sh
 ├── docs/
 │   ├── 01-prd.md
 │   ├── 02-tech-architecture-constraints.md
 │   ├── 03-frontend-prototype.md
 │   └── 04-wbs-task-list.md
-└── docker-compose.yml
+└── README.md
 ```
 
 ## 阶段交付文档
@@ -92,10 +96,18 @@ cp deploy/.env.server.example deploy/.env.server
 ## 已实现 API（MVP）
 - `POST /api/auth/login`
 - `GET /api/users/me`
-- `GET/POST/PUT /api/admin/users`（管理员）
-- `POST/GET/PUT/DELETE /api/providers`
+- `GET /api/admin/users`（管理员列表）
+- `POST /api/admin/users`（管理员创建用户）
+- `PUT /api/admin/users/{id}`（管理员更新用户）
+- `POST /api/providers`
+- `GET /api/providers`
+- `PUT /api/providers/{id}`
+- `DELETE /api/providers/{id}`
 - `POST /api/models/validate`
-- `POST/GET/PUT/DELETE /api/kb/libraries`
+- `POST /api/kb/libraries`
+- `GET /api/kb/libraries`
+- `PUT /api/kb/libraries/{id}`
+- `DELETE /api/kb/libraries/{id}`
 - `GET /api/kb/libraries/{id}/files`
 - `GET /api/kb/libraries/{id}/graph`
 - `POST /api/kb/libraries/{id}/graph/rebuild`
@@ -104,7 +116,10 @@ cp deploy/.env.server.example deploy/.env.server
 - `POST /api/kb/files/sync-directory`
 - `POST /api/kb/index/rebuild`
 - `GET /api/kb/tasks/{task_id}`
-- `POST/GET /api/chat/sessions`
+- `POST /api/chat/sessions`
+- `GET /api/chat/sessions`
+- `DELETE /api/chat/sessions/{id}`
+- `PATCH /api/chat/sessions/{id}`
 - `POST /api/chat/sessions/{id}/messages`（支持 SSE）
 - `GET /api/chat/sessions/{id}/messages`
 
@@ -132,7 +147,7 @@ EMBEDDING_FALLBACK_HASH=false
 `docker-compose` 中保留了可选 `embeddings` 服务（`profile=tei`，`linux/amd64`）。
 
 ```bash
-docker compose --profile tei up --build
+docker compose -f deploy/docker-compose.yml --profile tei up --build
 ```
 
 ## 升级提示
