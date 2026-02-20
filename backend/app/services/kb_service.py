@@ -26,8 +26,10 @@ from app.db.models import (
     User,
 )
 from app.services.graph_service import (
+    extract_entities_from_text,
     expand_query_terms_by_graph,
     get_library_graph_snapshot,
+    normalize_entity,
     rebuild_library_graph,
     score_merge,
     summarize_graph_sources,
@@ -163,6 +165,13 @@ def delete_knowledge_file(db: Session, *, knowledge_file: KnowledgeFile, user: U
     db.delete(knowledge_file)
     db.commit()
     logger.info(f'File {knowledge_file.id} deleted successfully')
+    try:
+        graph_stats = rebuild_library_graph(db, library.id)
+        logger.info(
+            f'[Delete] Graph rebuilt after delete: nodes={graph_stats.get("node_count", 0)} edges={graph_stats.get("edge_count", 0)}'
+        )
+    except Exception as exc:
+        logger.warning(f'[Delete] Graph rebuild failed: {exc}')
     
     should_delete_physical = False
     try:
@@ -218,6 +227,10 @@ def save_uploaded_file(db: Session, *, library: KnowledgeLibrary, uploaded_file:
         logger.info(f'[Upload] Starting indexing for file: {knowledge_file.id}')
         _reindex_single_file(db, library=library, knowledge_file=knowledge_file, text=text)
         logger.info(f'[Upload] Indexing completed for file: {knowledge_file.id}')
+        graph_stats = rebuild_library_graph(db, library.id)
+        logger.info(
+            f'[Upload] Graph rebuilt: nodes={graph_stats.get("node_count", 0)} edges={graph_stats.get("edge_count", 0)}'
+        )
     except Exception as e:
         # 索引失败时清理已创建的文件记录
         db.delete(knowledge_file)
@@ -377,6 +390,7 @@ def hybrid_search(
     if not library_ids:
         return []
 
+    settings = get_settings()
     query_embedding = embed_query(query)
 
     # 获取知识库中所有实体，用于查询扩展
@@ -385,10 +399,20 @@ def hybrid_search(
         .filter(KnowledgeEntity.library_id.in_(library_ids))
         .all()
     )
-    entity_map = {e.name: e.display_name for e in all_entities}
+    entities_by_name = {e.name: e for e in all_entities}
+    entities_by_display: dict[str, list[KnowledgeEntity]] = {}
+    entities_by_alias: dict[str, list[KnowledgeEntity]] = {}
+    for entity in all_entities:
+        display_norm = normalize_entity(entity.display_name)
+        entities_by_display.setdefault(display_norm, []).append(entity)
+        aliases = (entity.metadata_json or {}).get('aliases', [])
+        if isinstance(aliases, list):
+            for alias in aliases:
+                alias_norm = normalize_entity(str(alias))
+                if alias_norm:
+                    entities_by_alias.setdefault(alias_norm, []).append(entity)
     
     # 提取查询中的实体
-    from app.services.graph_service import extract_entities_from_text, TITLE_SUFFIXES
     query_entities = extract_entities_from_text(query, max_entities=10)
     
     # 从历史对话中提取实体，用于增强当前查询
@@ -402,15 +426,25 @@ def hybrid_search(
     # 合并当前查询实体和历史实体
     all_entities_for_search = list(set(query_entities + history_entities))
     
-    # 构建扩展查询词：原始查询 + 所有实体的已知别名
+    # 构建扩展查询词：原始查询 + 实体名 + 别名
     all_query_terms = [query]
     for qe in all_entities_for_search:
-        qe_norm = qe.lower() if qe else ""
-        # 如果实体是某个知识库实体的别名，添加正式名
-        for ent_name, ent_display in entity_map.items():
-            if ent_name == qe_norm or ent_display == qe:
-                all_query_terms.append(ent_name)
-                all_query_terms.append(ent_display)
+        qe_norm = normalize_entity(qe)
+        if not qe_norm:
+            continue
+        matched_entities: list[KnowledgeEntity] = []
+        direct = entities_by_name.get(qe_norm)
+        if direct:
+            matched_entities.append(direct)
+        matched_entities.extend(entities_by_display.get(qe_norm, []))
+        matched_entities.extend(entities_by_alias.get(qe_norm, []))
+
+        for entity in matched_entities:
+            all_query_terms.append(entity.name)
+            all_query_terms.append(entity.display_name)
+            aliases = (entity.metadata_json or {}).get('aliases', [])
+            if isinstance(aliases, list):
+                all_query_terms.extend(str(alias) for alias in aliases if alias)
 
     # 增加普通关键词分词（不仅仅是实体），解决非实体关键词检索遗漏问题
     raw_keywords = jieba.cut_for_search(query)
@@ -421,18 +455,20 @@ def hybrid_search(
     
     # 去重
     all_query_terms = list(set(all_query_terms))
+    keyword_queries = [term for term in all_query_terms if term and len(term) >= 2]
+    keyword_term_set = _normalize_search_terms(keyword_queries)
 
+    vector_distance_expr = Chunk.embedding.cosine_distance(query_embedding).label('vector_distance')
     vector_candidates = (
-        db.query(Chunk, KnowledgeFile.filename)
+        db.query(Chunk, KnowledgeFile.filename, vector_distance_expr)
         .join(KnowledgeFile, Chunk.file_id == KnowledgeFile.id)
         .filter(Chunk.library_id.in_(library_ids))
-        .order_by(Chunk.embedding.cosine_distance(query_embedding))
+        .order_by(vector_distance_expr)
         .limit(max(top_k * 2, 10))
         .all()
     )
 
     # 关键词检索：使用原始查询 + 扩展查询词
-    keyword_queries = [term for term in all_query_terms if term and len(term) >= 2]
     keyword_filters = [Chunk.content.ilike(f'%{term}%') for term in keyword_queries]
     keyword_candidates = []
     if keyword_filters:
@@ -444,11 +480,18 @@ def hybrid_search(
             .all()
         )
 
-    graph_expansion = expand_query_terms_by_graph(db, library_ids=library_ids, query=query, max_terms=8)
+    graph_expansion = expand_query_terms_by_graph(
+        db,
+        library_ids=library_ids,
+        query=query,
+        max_terms=max(6, min(int(settings.rag_graph_max_terms), 24)),
+    )
     graph_terms = graph_expansion.get('expanded_terms', [])
     graph_matches = graph_expansion.get('matched_entities', [])
     # 也将图谱扩展词加入检索
     all_search_terms = list(set(keyword_queries + graph_terms))
+    graph_term_set = _normalize_search_terms(all_search_terms)
+    matched_entity_terms = _normalize_search_terms(graph_matches)
     graph_filters = [Chunk.content.ilike(f'%{term}%') for term in all_search_terms if term and len(term.strip()) >= 2]
     graph_candidates = []
     if graph_filters:
@@ -462,23 +505,29 @@ def hybrid_search(
 
     merged: dict[str, dict] = {}
 
-    for rank, (chunk, filename) in enumerate(vector_candidates):
+    for rank, (chunk, filename, distance) in enumerate(vector_candidates):
         key = str(chunk.id)
-        score = 1.0 / (rank + 1)
+        vector_score, vector_similarity = _score_vector_candidate(distance, rank)
         merged[key] = _serialize_chunk_result(
             chunk,
             filename,
-            score,
+            vector_score,
             source='vector',
             matched_entities=graph_matches,
+            vector_similarity=vector_similarity,
+            keyword_overlap=0.0,
+            graph_overlap=0.0,
+            entity_overlap=0.0,
         )
 
     for rank, (chunk, filename) in enumerate(keyword_candidates):
         key = str(chunk.id)
-        score = 1.0 / (rank + 1)
+        keyword_overlap = _term_hit_ratio(chunk.content, keyword_term_set)
+        score = _score_sparse_candidate(rank, keyword_overlap, entity_boost=0.0, channel_weight=1.0)
         if key in merged:
             merged[key]['score'] = score_merge(float(merged[key]['score']), score)
             merged[key]['source'] = summarize_graph_sources([str(merged[key]['source']), 'keyword'])
+            merged[key]['keyword_overlap'] = max(float(merged[key].get('keyword_overlap', 0.0)), keyword_overlap)
         else:
             merged[key] = _serialize_chunk_result(
                 chunk,
@@ -486,14 +535,22 @@ def hybrid_search(
                 score,
                 source='keyword',
                 matched_entities=graph_matches,
+                vector_similarity=0.0,
+                keyword_overlap=keyword_overlap,
+                graph_overlap=0.0,
+                entity_overlap=0.0,
             )
 
     for rank, (chunk, filename) in enumerate(graph_candidates):
         key = str(chunk.id)
-        score = 0.8 / (rank + 1)
+        graph_overlap = _term_hit_ratio(chunk.content, graph_term_set)
+        entity_overlap = _term_hit_ratio(chunk.content, matched_entity_terms)
+        score = _score_sparse_candidate(rank, graph_overlap, entity_boost=entity_overlap, channel_weight=0.9)
         if key in merged:
             merged[key]['score'] = score_merge(float(merged[key]['score']), score)
             merged[key]['source'] = summarize_graph_sources([str(merged[key]['source']), 'graph'])
+            merged[key]['graph_overlap'] = max(float(merged[key].get('graph_overlap', 0.0)), graph_overlap)
+            merged[key]['entity_overlap'] = max(float(merged[key].get('entity_overlap', 0.0)), entity_overlap)
         else:
             merged[key] = _serialize_chunk_result(
                 chunk,
@@ -501,10 +558,14 @@ def hybrid_search(
                 score,
                 source='graph',
                 matched_entities=graph_matches,
+                vector_similarity=0.0,
+                keyword_overlap=0.0,
+                graph_overlap=graph_overlap,
+                entity_overlap=entity_overlap,
             )
 
     ordered = sorted(merged.values(), key=lambda item: item['score'], reverse=True)
-    return ordered[:top_k]
+    return _finalize_retrieval_hits(ordered, top_k=top_k)
 
 
 def _serialize_chunk_result(
@@ -513,6 +574,10 @@ def _serialize_chunk_result(
     score: float,
     source: str,
     matched_entities: list[str] | None = None,
+    vector_similarity: float = 0.0,
+    keyword_overlap: float = 0.0,
+    graph_overlap: float = 0.0,
+    entity_overlap: float = 0.0,
 ) -> dict:
     return {
         'chunk_id': chunk.id,
@@ -520,10 +585,93 @@ def _serialize_chunk_result(
         'library_id': chunk.library_id,
         'file_name': filename,
         'snippet': chunk.content[:500],
-        'score': score,
+        'score': round(float(score), 6),
         'source': source,
         'matched_entities': matched_entities or [],
+        'vector_similarity': round(float(vector_similarity), 6),
+        'keyword_overlap': round(float(keyword_overlap), 6),
+        'graph_overlap': round(float(graph_overlap), 6),
+        'entity_overlap': round(float(entity_overlap), 6),
     }
+
+
+def _normalize_search_terms(terms: list[str], *, max_terms: int = 28) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        norm = normalize_entity(str(term))
+        if len(norm) < 2:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        normalized.append(norm)
+        if len(normalized) >= max_terms:
+            break
+    return normalized
+
+
+def _term_hit_ratio(text: str, normalized_terms: list[str]) -> float:
+    if not text or not normalized_terms:
+        return 0.0
+    haystack = text.lower()
+    hit_count = sum(1 for term in normalized_terms if term and term.lower() in haystack)
+    denominator = max(1, min(len(normalized_terms), 8))
+    return round(min(1.0, hit_count / denominator), 6)
+
+
+def _score_vector_candidate(distance: float | None, rank: int) -> tuple[float, float]:
+    safe_distance = 1.0 if distance is None else max(0.0, float(distance))
+    vector_similarity = max(0.0, min(1.0, 1.0 - safe_distance))
+    rank_signal = 1.0 / (rank + 1)
+    score = (0.85 * vector_similarity) + (0.15 * rank_signal)
+    return round(score, 6), round(vector_similarity, 6)
+
+
+def _score_sparse_candidate(rank: int, hit_ratio: float, *, entity_boost: float, channel_weight: float) -> float:
+    rank_signal = 1.0 / (rank + 1)
+    raw_score = (0.55 * float(hit_ratio)) + (0.35 * rank_signal) + (0.10 * float(entity_boost))
+    return round(float(channel_weight) * raw_score, 6)
+
+
+def _is_retrieval_hit(candidates: list[dict]) -> bool:
+    settings = get_settings()
+    if not candidates:
+        return False
+
+    top1_score = float(candidates[0].get('score') or 0.0)
+    support_count = sum(1 for item in candidates if float(item.get('score') or 0.0) >= float(settings.rag_min_support_score))
+    if top1_score < float(settings.rag_min_top1_score):
+        return False
+    if support_count < int(settings.rag_min_support_count):
+        return False
+
+    lexical_or_graph_signal = any(
+        (
+            float(item.get('keyword_overlap') or 0.0) > 0.0
+            or float(item.get('graph_overlap') or 0.0) > 0.0
+            or float(item.get('entity_overlap') or 0.0) > 0.0
+        )
+        for item in candidates[: max(3, int(settings.rag_min_support_count))]
+    )
+    semantic_signal = float(candidates[0].get('vector_similarity') or 0.0) >= 0.18
+    return lexical_or_graph_signal or semantic_signal
+
+
+def _finalize_retrieval_hits(ordered: list[dict], *, top_k: int) -> list[dict]:
+    if not ordered:
+        return []
+    settings = get_settings()
+    min_item_score = float(settings.rag_min_item_score)
+    pruned = [item for item in ordered if float(item.get('score') or 0.0) >= min_item_score]
+    if not pruned:
+        return []
+
+    validation_window = pruned[: max(top_k * 2, int(settings.rag_min_support_count) + 1)]
+    if not _is_retrieval_hit(validation_window):
+        return []
+
+    return pruned[:top_k]
 
 
 def _resolve_library_root(root_path: str | None, user_id: UUID, owner_type: OwnerTypeEnum) -> Path:

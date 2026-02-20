@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import re
 from uuid import UUID
 
@@ -82,6 +83,26 @@ TITLE_SUFFIXES = {
     '教授', '副教授', '讲师', '助教', '老师', '医生', '护士', '医师',
 }
 
+ALIAS_HINTS = {
+    '又名', '别名', '亦称', '又称', '也称', '也叫', '又叫', '俗称', '简称', '即', '法号', '绰号'
+}
+ALIAS_SPLIT_PATTERN = re.compile(r'[、,，/|；;和与及或]')
+ALIAS_CONTEXT_PATTERN = re.compile(
+    r'(?P<main>[\u4e00-\u9fffA-Za-z0-9_\-]{2,24})\s*[（(](?P<inside>[^）\)]{1,56})[）)]'
+)
+ALIAS_INLINE_PATTERN = re.compile(
+    r'(?P<left>[\u4e00-\u9fffA-Za-z0-9_\-]{2,24})\s*'
+    r'(?:又名|别名|亦称|又称|也称|也叫|又叫|俗称|简称|即|法号|绰号)\s*'
+    r'(?P<right>[\u4e00-\u9fffA-Za-z0-9_\-、,，/|；;和与及或]{2,56})'
+)
+RELATION_TYPE_WEIGHTS: dict[str, float] = {
+    'is_a': 1.25,
+    'contains': 1.10,
+    'depends_on': 1.20,
+    'causes': 1.00,
+    'co_occurs': 0.70,
+}
+
 # 常见姓氏（用于人名匹配）
 COMMON_SURNAMES = {
     '王', '李', '张', '刘', '陈', '杨', '赵', '黄', '周', '吴',
@@ -100,6 +121,86 @@ def normalize_entity(name: str) -> str:
     if re.fullmatch(r'[A-Za-z0-9_\-/ ]+', stripped):
         return stripped.lower()
     return stripped
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for item in items:
+        norm = normalize_entity(item)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        results.append(item)
+    return results
+
+
+def _extract_alias_terms(raw: str) -> list[str]:
+    if not raw:
+        return []
+    cleaned = raw
+    for hint in ALIAS_HINTS:
+        cleaned = cleaned.replace(hint, ' ')
+    pieces = ALIAS_SPLIT_PATTERN.split(cleaned)
+    terms: list[str] = []
+    for piece in pieces:
+        piece = piece.strip(' \t\r\n:：,，。;；()（）[]{}"\'“”‘’')
+        if len(piece) < 2:
+            continue
+        for token in re.findall(r'[\u4e00-\u9fffA-Za-z0-9_\-]{2,24}', piece):
+            token = token.strip()
+            if len(token) >= 2:
+                terms.append(token)
+    return _dedupe_keep_order(terms)
+
+
+def choose_canonical_alias(candidates: list[str]) -> str:
+    if not candidates:
+        return ''
+
+    def rank(name: str) -> tuple[int, int]:
+        norm = normalize_entity(name)
+        title_like = any(norm.endswith(suffix) for suffix in TITLE_SUFFIXES)
+        # 优先非称谓实体，再优先更长名称（如“猪八戒”优先于“八戒”）
+        return (0 if title_like else 1, len(norm))
+
+    return max(candidates, key=rank)
+
+
+def extract_alias_groups_from_text(text: str, *, max_groups: int = 40) -> list[list[str]]:
+    if not text:
+        return []
+
+    groups: list[list[str]] = []
+    seen_signatures: set[tuple[str, ...]] = set()
+
+    def push_group(items: list[str]) -> None:
+        unique_items = _dedupe_keep_order(items)
+        if len(unique_items) < 2:
+            return
+        signature = tuple(sorted(normalize_entity(item) for item in unique_items))
+        if signature in seen_signatures:
+            return
+        seen_signatures.add(signature)
+        groups.append(unique_items)
+
+    for match in ALIAS_CONTEXT_PATTERN.finditer(text):
+        main = match.group('main').strip()
+        inside = match.group('inside').strip()
+        if not any(hint in inside for hint in ALIAS_HINTS):
+            continue
+        push_group([main, *_extract_alias_terms(inside)])
+        if len(groups) >= max_groups:
+            return groups
+
+    for match in ALIAS_INLINE_PATTERN.finditer(text):
+        left = match.group('left').strip()
+        right = match.group('right').strip()
+        push_group([left, *_extract_alias_terms(right)])
+        if len(groups) >= max_groups:
+            return groups
+
+    return groups
 
 
 def resolve_entity_alias(entities: list[str]) -> dict[str, str]:
@@ -162,6 +263,10 @@ def extract_entities_from_text(text: str, *, max_entities: int = 20) -> list[str
 
     # 英文实体
     candidates.extend(EN_ENTITY_PATTERN.findall(text))
+
+    # 别名组（如：猪八戒（又名悟能）、悟能又叫八戒）
+    for alias_group in extract_alias_groups_from_text(text, max_groups=12):
+        candidates.extend(alias_group)
 
     # 实体消歧：将"皮副市长"等称呼映射到正式人名"皮杰"
     alias_map = resolve_entity_alias(candidates)
@@ -263,64 +368,95 @@ def rebuild_library_graph(db: Session, library_id: UUID) -> dict:
     entity_counter: dict[str, dict] = {}
     relation_counter: dict[tuple[str, str, str], dict] = {}
 
+    # 全局别名映射：alias_norm -> canonical_norm
+    alias_to_canonical: dict[str, str] = {}
+    canonical_display: dict[str, str] = {}
+
     for chunk in chunks:
-        chunk_entities = extract_entities_from_text(chunk.content, max_entities=20)
-        for display_name in chunk_entities:
-            normalized = normalize_entity(display_name)
-            if normalized not in entity_counter:
-                entity_counter[normalized] = {
+        for alias_group in extract_alias_groups_from_text(chunk.content, max_groups=20):
+            canonical = choose_canonical_alias(alias_group)
+            canonical_norm = normalize_entity(canonical)
+            if not canonical_norm:
+                continue
+            if canonical_norm not in canonical_display:
+                canonical_display[canonical_norm] = canonical
+            for alias in alias_group:
+                alias_norm = normalize_entity(alias)
+                if not alias_norm:
+                    continue
+                alias_to_canonical[alias_norm] = canonical_norm
+
+        chunk_entities = extract_entities_from_text(chunk.content, max_entities=24)
+        for raw_entity in chunk_entities:
+            raw_norm = normalize_entity(raw_entity)
+            if not raw_norm:
+                continue
+            canonical_norm = alias_to_canonical.get(raw_norm, raw_norm)
+            display_name = canonical_display.get(canonical_norm, raw_entity)
+
+            if canonical_norm not in entity_counter:
+                entity_counter[canonical_norm] = {
                     'display_name': display_name,
                     'frequency': 1,
+                    'aliases': set(),
                 }
             else:
-                entity_counter[normalized]['frequency'] += 1
+                entity_counter[canonical_norm]['frequency'] += 1
+
+            if raw_norm != canonical_norm:
+                entity_counter[canonical_norm]['aliases'].add(raw_entity)
 
         chunk_relations = extract_relations_from_text(chunk.content)
         for source_name, target_name, relation_type, evidence in chunk_relations:
-            source_norm = normalize_entity(source_name)
-            target_norm = normalize_entity(target_name)
+            source_raw_norm = normalize_entity(source_name)
+            target_raw_norm = normalize_entity(target_name)
+            source_norm = alias_to_canonical.get(source_raw_norm, source_raw_norm)
+            target_norm = alias_to_canonical.get(target_raw_norm, target_raw_norm)
+            if not source_norm or not target_norm or source_norm == target_norm:
+                continue
+            if source_norm > target_norm:
+                source_norm, target_norm = target_norm, source_norm
             if source_norm not in entity_counter or target_norm not in entity_counter:
                 continue
+
             key = (source_norm, target_norm, relation_type)
             if key not in relation_counter:
                 relation_counter[key] = {'weight': 1, 'evidence': [evidence]}
             else:
                 relation_counter[key]['weight'] += 1
-                if len(relation_counter[key]['evidence']) < 3:
-                    if evidence not in relation_counter[key]['evidence']:
-                        relation_counter[key]['evidence'].append(evidence)
+                if len(relation_counter[key]['evidence']) < 3 and evidence not in relation_counter[key]['evidence']:
+                    relation_counter[key]['evidence'].append(evidence)
 
     if not entity_counter:
         return {'library_id': library_id, 'node_count': 0, 'edge_count': 0, 'chunk_count': len(chunks)}
 
-    # 插入新实体，使用 try-except 处理可能的并发冲突
-    entities = []
+    entities: list[KnowledgeEntity] = []
     for normalized, data in entity_counter.items():
-        entity = KnowledgeEntity(
-            library_id=library_id,
-            name=normalized,
-            display_name=data['display_name'],
-            entity_type='concept',
-            frequency=data['frequency'],
-            metadata_json={},
+        metadata = {'aliases': sorted({a for a in data.get('aliases', set()) if normalize_entity(a) != normalized})}
+        entities.append(
+            KnowledgeEntity(
+                library_id=library_id,
+                name=normalized,
+                display_name=data['display_name'],
+                entity_type='concept',
+                frequency=data['frequency'],
+                metadata_json=metadata,
+            )
         )
-        entities.append(entity)
-    
-    # 逐个插入，忽略已存在的
+
     for entity in entities:
         existing = db.query(KnowledgeEntity).filter(
             KnowledgeEntity.library_id == library_id,
-            KnowledgeEntity.name == entity.name
+            KnowledgeEntity.name == entity.name,
         ).first()
         if not existing:
             db.add(entity)
-    
     db.commit()
 
     entity_rows = db.query(KnowledgeEntity).filter(KnowledgeEntity.library_id == library_id).all()
     entity_id_by_name = {item.name: item.id for item in entity_rows}
 
-    relations = []
+    relations: list[KnowledgeRelation] = []
     for (source_name, target_name, relation_type), rel_data in relation_counter.items():
         source_id = entity_id_by_name.get(source_name)
         target_id = entity_id_by_name.get(target_name)
@@ -414,7 +550,19 @@ def get_library_graph_snapshot(db: Session, library_id: UUID, *, limit_nodes: in
 def expand_query_terms_by_graph(db: Session, *, library_ids: list[UUID], query: str, max_terms: int = 8) -> dict:
     query_entities = extract_entities_from_text(query, max_entities=max_terms)
     if not query_entities:
-        return {'expanded_terms': [], 'matched_entities': []}
+        for token in jieba.cut_for_search(query):
+            token = token.strip()
+            token_norm = normalize_entity(token)
+            if len(token_norm) < 2:
+                continue
+            if token_norm in EN_STOPWORDS or token_norm in ZH_STOPWORDS:
+                continue
+            query_entities.append(token)
+            if len(query_entities) >= max_terms:
+                break
+        query_entities = _dedupe_keep_order(query_entities)
+        if not query_entities:
+            return {'expanded_terms': [], 'matched_entities': []}
 
     # 获取知识库中所有的实体名（用于别名匹配）
     all_entities = (
@@ -422,56 +570,73 @@ def expand_query_terms_by_graph(db: Session, *, library_ids: list[UUID], query: 
         .filter(KnowledgeEntity.library_id.in_(library_ids))
         .all()
     )
-    entity_names = {e.name for e in all_entities}
-    entity_display_names = {e.display_name for e in all_entities}
-    
-    # 查询实体消歧：看查询中的实体是否能匹配知识库中的实体
-    # 例如：用户输入"皮副市长"，知识库中有"皮杰"
-    expanded_query_entities = []
-    for qe in query_entities:
-        expanded_query_entities.append(qe)
-        # 如果查询实体不在知识库中，尝试找可能的别名
-        if qe not in entity_names and qe not in entity_display_names:
-            # 尝试去掉常见职位后缀后匹配
-            for suffix in TITLE_SUFFIXES:
-                if qe.endswith(suffix):
-                    name_part = qe[:-len(suffix)]
-                    for ent_name in entity_names:
-                        if ent_name.startswith(name_part[:2]) or ent_name == name_part:
-                            expanded_query_entities.append(ent_name)
-                            break
-                    for ent_display in entity_display_names:
-                        if ent_display.startswith(name_part[:2]) or ent_display == name_part:
-                            if ent_display not in expanded_query_entities:
-                                expanded_query_entities.append(ent_display)
-                            break
+    if not all_entities:
+        return {'expanded_terms': [], 'matched_entities': []}
 
-    # 去重
-    expanded_query_entities = list(set(expanded_query_entities))
-    normalized_query_entities = [normalize_entity(item) for item in expanded_query_entities]
+    entities_by_name = {item.name: item for item in all_entities}
+    entities_by_display: dict[str, list[KnowledgeEntity]] = defaultdict(list)
+    entities_by_alias: dict[str, list[KnowledgeEntity]] = defaultdict(list)
 
-    matched = (
-        db.query(KnowledgeEntity)
-        .filter(KnowledgeEntity.library_id.in_(library_ids), KnowledgeEntity.name.in_(normalized_query_entities))
-        .all()
-    )
+    for entity in all_entities:
+        display_norm = normalize_entity(entity.display_name)
+        if display_norm:
+            entities_by_display[display_norm].append(entity)
+        aliases = (entity.metadata_json or {}).get('aliases', [])
+        if isinstance(aliases, list):
+            for alias in aliases:
+                alias_norm = normalize_entity(str(alias))
+                if alias_norm:
+                    entities_by_alias[alias_norm].append(entity)
 
-    if not matched:
-        fuzzy_filters = [KnowledgeEntity.display_name.ilike(f'%{item}%') for item in expanded_query_entities if item]
-        if fuzzy_filters:
-            matched = (
-                db.query(KnowledgeEntity)
-                .filter(KnowledgeEntity.library_id.in_(library_ids), or_(*fuzzy_filters))
-                .order_by(KnowledgeEntity.frequency.desc())
-                .limit(max_terms)
-                .all()
-            )
+    expanded_query_entities: list[str] = list(query_entities)
+    for alias_group in extract_alias_groups_from_text(query, max_groups=8):
+        expanded_query_entities.extend(alias_group)
 
+    matched_map: dict[UUID, KnowledgeEntity] = {}
+    for query_entity in _dedupe_keep_order(expanded_query_entities):
+        query_norm = normalize_entity(query_entity)
+        if not query_norm:
+            continue
+
+        direct = entities_by_name.get(query_norm)
+        if direct:
+            matched_map[direct.id] = direct
+
+        for item in entities_by_display.get(query_norm, []):
+            matched_map[item.id] = item
+        for item in entities_by_alias.get(query_norm, []):
+            matched_map[item.id] = item
+
+        # 保留原有“职位后缀”消歧能力
+        for suffix in TITLE_SUFFIXES:
+            if not query_entity.endswith(suffix):
+                continue
+            name_part = query_entity[:-len(suffix)]
+            if len(name_part) < 2:
+                break
+            for entity in all_entities:
+                if entity.name.startswith(name_part[:2]) or entity.display_name.startswith(name_part[:2]):
+                    matched_map[entity.id] = entity
+            break
+
+    if not matched_map:
+        for query_entity in _dedupe_keep_order(expanded_query_entities):
+            query_norm = normalize_entity(query_entity)
+            if not query_norm:
+                continue
+            for entity in all_entities:
+                aliases = (entity.metadata_json or {}).get('aliases', [])
+                alias_text = ' '.join(str(alias) for alias in aliases if alias)
+                haystack = f'{entity.display_name} {entity.name} {alias_text}'.lower()
+                if query_norm.lower() in haystack:
+                    matched_map[entity.id] = entity
+
+    matched = sorted(matched_map.values(), key=lambda item: item.frequency, reverse=True)[: max_terms * 2]
     if not matched:
         return {'expanded_terms': [], 'matched_entities': []}
 
     matched_ids = [item.id for item in matched]
-    matched_names = [item.display_name for item in matched]
+    matched_names = _dedupe_keep_order([item.display_name for item in matched])[:max_terms]
 
     linked = (
         db.query(KnowledgeRelation)
@@ -487,20 +652,34 @@ def expand_query_terms_by_graph(db: Session, *, library_ids: list[UUID], query: 
         .all()
     )
 
-    expanded_entity_ids: set[UUID] = set(matched_ids)
+    expanded_scores: dict[UUID, float] = {}
+    for item in matched:
+        expanded_scores[item.id] = 2.0 + min(float(item.frequency), 100.0) / 100.0
+
     for rel in linked:
-        expanded_entity_ids.add(rel.source_entity_id)
-        expanded_entity_ids.add(rel.target_entity_id)
+        relation_factor = RELATION_TYPE_WEIGHTS.get(rel.relation_type, 0.7)
+        edge_gain = relation_factor * max(1.0, float(rel.weight))
+        expanded_scores[rel.source_entity_id] = expanded_scores.get(rel.source_entity_id, 0.0) + edge_gain
+        expanded_scores[rel.target_entity_id] = expanded_scores.get(rel.target_entity_id, 0.0) + edge_gain
 
-    expanded_entities = (
-        db.query(KnowledgeEntity)
-        .filter(KnowledgeEntity.id.in_(list(expanded_entity_ids)))
-        .order_by(KnowledgeEntity.frequency.desc())
-        .limit(max_terms)
-        .all()
-    )
+    ranked_entity_ids = [
+        entity_id
+        for entity_id, _ in sorted(expanded_scores.items(), key=lambda item: item[1], reverse=True)[: max_terms * 3]
+    ]
+    if not ranked_entity_ids:
+        return {'expanded_terms': [], 'matched_entities': matched_names}
 
-    expanded_terms = [item.display_name for item in expanded_entities]
+    expanded_rows = db.query(KnowledgeEntity).filter(KnowledgeEntity.id.in_(ranked_entity_ids)).all()
+    row_by_id = {item.id: item for item in expanded_rows}
+    expanded_entities = [row_by_id[entity_id] for entity_id in ranked_entity_ids if entity_id in row_by_id][: max_terms * 2]
+
+    expanded_terms: list[str] = []
+    for item in expanded_entities:
+        expanded_terms.append(item.display_name)
+        aliases = (item.metadata_json or {}).get('aliases', [])
+        if isinstance(aliases, list):
+            expanded_terms.extend(str(alias) for alias in aliases[:3])
+    expanded_terms = _dedupe_keep_order(expanded_terms)[: max_terms * 2]
     return {'expanded_terms': expanded_terms, 'matched_entities': matched_names}
 
 

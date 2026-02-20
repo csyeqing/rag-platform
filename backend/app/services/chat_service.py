@@ -95,8 +95,6 @@ def generate_reply(
     if session.user_id != user.id and user.role != RoleEnum.admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='No access to this session')
 
-    selected_provider = _resolve_provider(db, user, provider_config_id or session.provider_config_id)
-
     user_message = ChatMessage(session_id=session.id, role=ChatRoleEnum.user, content=content, citations=[])
     db.add(user_message)
     db.commit()
@@ -104,6 +102,20 @@ def generate_reply(
 
     available_library_ids = _resolve_libraries(db, user, session.library_id, library_ids)
     retrieved = hybrid_search(db, library_ids=available_library_ids, query=content, top_k=top_k)
+
+    if available_library_ids and not retrieved:
+        no_hit_content = _build_no_hit_message()
+        assistant_message = ChatMessage(
+            session_id=session.id,
+            role=ChatRoleEnum.assistant,
+            content=no_hit_content,
+            citations=[],
+        )
+        db.add(assistant_message)
+        db.commit()
+        return no_hit_content, []
+
+    selected_provider = _resolve_provider(db, user, provider_config_id or session.provider_config_id)
 
     if use_rerank and retrieved:
         runtime = to_runtime_config(selected_provider)
@@ -149,10 +161,7 @@ def generate_reply(
             'RAG_CONTEXT=' + json.dumps(serializable_retrieved, ensure_ascii=False)
         )
     else:
-        system_content = (
-            '你是企业知识助手。当前未命中知识库，请直接基于模型能力回答用户问题。'
-            '如果信息不确定，请明确说明不确定性。'
-        )
+        system_content = '你是企业知识助手。在未选择知识库时，可直接基于模型能力回答用户问题。'
 
     messages: list[dict[str, Any]] = [{'role': 'system', 'content': system_content}]
     for msg in history:
@@ -229,8 +238,6 @@ def generate_reply_stream(
     if session.user_id != user.id and user.role != RoleEnum.admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='No access to this session')
 
-    selected_provider = _resolve_provider(db, user, provider_config_id or session.provider_config_id)
-
     # 获取历史消息（用于多轮对话上下文增强）
     history = (
         db.query(ChatMessage)
@@ -256,6 +263,26 @@ def generate_reply_stream(
         top_k=top_k,
         history_context=history_context,
     )
+
+    if available_library_ids and not retrieved:
+        no_hit_content = _build_no_hit_message()
+        session_id_value = session.id
+
+        def no_hit_stream() -> Iterator[str]:
+            assistant_message = ChatMessage(
+                session_id=session_id_value,
+                role=ChatRoleEnum.assistant,
+                content=no_hit_content,
+                citations=[],
+            )
+            db.add(assistant_message)
+            db.commit()
+            yield f"data: {json.dumps({'type': 'delta', 'delta': no_hit_content}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'citations': []}, ensure_ascii=False)}\n\n"
+
+        return no_hit_stream(), []
+
+    selected_provider = _resolve_provider(db, user, provider_config_id or session.provider_config_id)
 
     # 重新排序
     if use_rerank and retrieved:
@@ -299,10 +326,7 @@ def generate_reply_stream(
             '知识库检索结果：\n' + json.dumps(serializable_retrieved, ensure_ascii=False, indent=2)
         )
     else:
-        system_content = (
-            '你是企业知识助手。当前未命中知识库，请直接基于模型能力回答用户问题。'
-            '如果信息不确定，请明确说明不确定性。'
-        )
+        system_content = '你是企业知识助手。在未选择知识库时，可直接基于模型能力回答用户问题。'
 
     # 构建消息列表（history 已在前面获取，不包含当前用户消息）
     messages: list[dict[str, Any]] = [{'role': 'system', 'content': system_content}]
@@ -401,3 +425,13 @@ def _resolve_libraries(
         if library.owner_id == user.id or user.role == RoleEnum.admin:
             available.append(library.id)
     return available
+
+
+def _build_no_hit_message() -> str:
+    return (
+        '当前问题未命中所选知识库内容，已停止使用通用大模型兜底回答。\n'
+        '建议操作：\n'
+        '1. 使用别名/简称重试（例如：猪八戒、八戒、悟能）\n'
+        '2. 在知识库页面执行“重建索引”和“重建图谱”\n'
+        '3. 确认相关文档已上传到当前会话选择的知识库'
+    )

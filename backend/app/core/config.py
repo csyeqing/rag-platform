@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 16
     embedding_fallback_hash: bool = True
     request_timeout_seconds: int = 30
+    rag_min_top1_score: float = 0.35
+    rag_min_support_score: float = 0.22
+    rag_min_support_count: int = 2
+    rag_min_item_score: float = 0.12
+    rag_graph_max_terms: int = 12
 
     @property
     def parsed_cors_origins(self) -> list[str]:
