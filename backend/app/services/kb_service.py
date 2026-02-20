@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 from uuid import UUID
 
+import jieba
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -30,6 +31,8 @@ from app.services.graph_service import (
     rebuild_library_graph,
     score_merge,
     summarize_graph_sources,
+    ZH_STOPWORDS,
+    EN_STOPWORDS,
 )
 from app.services.embedding_service import embed_query, embed_texts
 
@@ -408,6 +411,16 @@ def hybrid_search(
             if ent_name == qe_norm or ent_display == qe:
                 all_query_terms.append(ent_name)
                 all_query_terms.append(ent_display)
+
+    # 增加普通关键词分词（不仅仅是实体），解决非实体关键词检索遗漏问题
+    raw_keywords = jieba.cut_for_search(query)
+    for k in raw_keywords:
+        k = k.strip()
+        if len(k) >= 2 and k.lower() not in EN_STOPWORDS and k not in ZH_STOPWORDS:
+            all_query_terms.append(k)
+    
+    # 去重
+    all_query_terms = list(set(all_query_terms))
 
     vector_candidates = (
         db.query(Chunk, KnowledgeFile.filename)
