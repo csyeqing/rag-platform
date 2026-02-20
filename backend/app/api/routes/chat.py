@@ -11,7 +11,15 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.db.models import User
 from app.db.session import get_db
-from app.schemas.chat import ChatMessageCreateRequest, ChatMessageListResponse, ChatMessageResponse, ChatSessionCreateRequest, ChatSessionResponse
+from app.schemas.chat import (
+    ChatMessageCreateRequest,
+    ChatMessageListResponse,
+    ChatMessageResponse,
+    ChatSessionCreateRequest,
+    ChatSessionResponse,
+    ChatSessionUpdateRequest,
+)
+from app.services.retrieval_profile_service import get_profile_config_by_id
 from app.services.chat_service import create_session, delete_session, generate_reply, generate_reply_stream, list_messages, list_sessions
 from app.utils.audit import write_audit_log
 
@@ -30,6 +38,7 @@ def create_session_endpoint(
         title=payload.title,
         provider_config_id=payload.provider_config_id,
         library_id=payload.library_id,
+        retrieval_profile_id=payload.retrieval_profile_id,
     )
     write_audit_log(
         db,
@@ -62,7 +71,7 @@ def delete_session_endpoint(
 @router.patch('/sessions/{session_id}', response_model=ChatSessionResponse)
 def update_session_endpoint(
     session_id: UUID,
-    payload: ChatSessionCreateRequest,
+    payload: ChatSessionUpdateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ChatSessionResponse:
@@ -71,13 +80,17 @@ def update_session_endpoint(
     if not session:
         from fastapi import HTTPException, status
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Session not found')
-    if payload.title is not None:
+    incoming = payload.model_dump(exclude_unset=True)
+    if 'title' in incoming:
         session.title = payload.title
-    if payload.provider_config_id is not None:
+    if 'provider_config_id' in incoming:
         session.provider_config_id = payload.provider_config_id
-    if 'library_id' in payload.model_dump():
+    if 'library_id' in incoming:
         session.library_id = payload.library_id
-    if 'show_citations' in payload.model_dump():
+    if 'retrieval_profile_id' in incoming:
+        resolved_profile_id, _ = get_profile_config_by_id(db, payload.retrieval_profile_id)
+        session.retrieval_profile_id = resolved_profile_id
+    if 'show_citations' in incoming:
         session.show_citations = payload.show_citations
     db.commit()
     db.refresh(session)
@@ -100,6 +113,7 @@ def create_message_endpoint(
             content=payload.content,
             provider_config_id=payload.provider_config_id,
             library_ids=payload.library_ids,
+            retrieval_profile_id=payload.retrieval_profile_id,
             top_k=payload.top_k,
             use_rerank=payload.use_rerank,
             show_citations=payload.show_citations,
@@ -131,6 +145,7 @@ def create_message_endpoint(
         content=payload.content,
         provider_config_id=payload.provider_config_id,
         library_ids=payload.library_ids,
+        retrieval_profile_id=payload.retrieval_profile_id,
         top_k=payload.top_k,
         use_rerank=payload.use_rerank,
         show_citations=payload.show_citations,
@@ -168,6 +183,7 @@ def _to_session_response(session) -> ChatSessionResponse:
         title=session.title,
         provider_config_id=session.provider_config_id,
         library_id=session.library_id,
+        retrieval_profile_id=session.retrieval_profile_id,
         show_citations=session.show_citations,
         created_at=session.created_at,
         updated_at=session.updated_at,

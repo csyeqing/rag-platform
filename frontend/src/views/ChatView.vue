@@ -34,7 +34,7 @@
 
     <el-card class="h-[74vh] overflow-hidden">
       <template #header>
-        <div class="grid gap-2 md:grid-cols-3">
+        <div class="grid gap-2 md:grid-cols-4">
           <el-select v-model="currentProviderId" placeholder="选择模型配置">
             <el-option
               v-for="item in providers"
@@ -43,12 +43,30 @@
               :value="item.id"
             />
           </el-select>
-          <el-select v-model="currentLibraryId" :disabled="libraryLocked" clearable placeholder="选择知识库">
+          <el-select
+            v-model="currentLibraryId"
+            :disabled="libraryLocked"
+            clearable
+            placeholder="选择知识库"
+            @change="handleLibraryChange"
+          >
             <el-option
               v-for="library in libraries"
               :key="library.id"
-              :label="`${library.name} (${library.owner_type})`"
+              :label="`${library.name} (${libraryTypeLabel(library.library_type)}/${library.owner_type})`"
               :value="library.id"
+            />
+          </el-select>
+          <el-select
+            v-model="currentProfileId"
+            placeholder="选择检索优化配置"
+            @change="handleProfileChange"
+          >
+            <el-option
+              v-for="profile in retrievalProfiles"
+              :key="profile.id"
+              :label="`${profile.name} (${profileTypeLabel(profile.profile_type)})${profile.is_default ? ' [默认]' : ''}`"
+              :value="profile.id"
             />
           </el-select>
           <div class="flex items-center justify-end gap-2">
@@ -115,20 +133,23 @@ import {
   listLibraries,
   listMessages,
   listProviders,
+  listRetrievalProfiles,
   listSessions,
   streamChatMessage,
   updateSession,
 } from '../api'
-import type { ChatMessage, ChatSession, KnowledgeLibrary, ProviderConfig } from '../types'
+import type { ChatMessage, ChatSession, KnowledgeLibrary, ProviderConfig, RetrievalProfile } from '../types'
 
 const sessions = ref<ChatSession[]>([])
 const providers = ref<ProviderConfig[]>([])
 const libraries = ref<KnowledgeLibrary[]>([])
+const retrievalProfiles = ref<RetrievalProfile[]>([])
 const messages = ref<ChatMessage[]>([])
 
 const selectedSessionId = ref('')
 const currentProviderId = ref('')
 const currentLibraryId = ref('')
+const currentProfileId = ref('')
 const input = ref('')
 const libraryLocked = ref(false) // 知识库选择是否已锁定
 const showCitations = ref(true)
@@ -140,6 +161,42 @@ function formatDate(value: string) {
   return new Date(value).toLocaleString()
 }
 
+function profileTypeLabel(value: RetrievalProfile['profile_type']) {
+  const map: Record<RetrievalProfile['profile_type'], string> = {
+    general: '通用',
+    novel_story: '小说/故事',
+    enterprise_docs: '公司资料',
+    scientific_paper: '科学论文',
+    humanities_paper: '文科论文',
+  }
+  return map[value] || value
+}
+
+function libraryTypeLabel(value: KnowledgeLibrary['library_type']) {
+  const map: Record<KnowledgeLibrary['library_type'], string> = {
+    general: '通用',
+    novel_story: '小说/故事',
+    enterprise_docs: '公司资料',
+    scientific_paper: '科学论文',
+    humanities_paper: '文科论文',
+  }
+  return map[value] || value
+}
+
+function selectProfileForLibraryType(libraryType: KnowledgeLibrary['library_type']) {
+  const current = retrievalProfiles.value.find((item) => item.id === currentProfileId.value)
+  if (current && current.profile_type === libraryType) {
+    return current.id
+  }
+  return (
+    retrievalProfiles.value.find((item) => item.profile_type === libraryType && item.is_default)?.id ||
+    retrievalProfiles.value.find((item) => item.profile_type === libraryType)?.id ||
+    retrievalProfiles.value.find((item) => item.is_default)?.id ||
+    retrievalProfiles.value[0]?.id ||
+    ''
+  )
+}
+
 function handleInputKeydown(event: KeyboardEvent) {
   if (event.key === 'Enter' && !event.ctrlKey) {
     event.preventDefault()
@@ -149,15 +206,17 @@ function handleInputKeydown(event: KeyboardEvent) {
 }
 
 async function loadBasicData() {
-  const [sessionRows, providerRows, libraryRows] = await Promise.all([
+  const [sessionRows, providerRows, libraryRows, profileRows] = await Promise.all([
     listSessions(),
     listProviders(),
     listLibraries(),
+    listRetrievalProfiles(),
   ])
 
   sessions.value = sessionRows
   providers.value = providerRows
   libraries.value = libraryRows
+  retrievalProfiles.value = profileRows
 
   if (!selectedSessionId.value && sessionRows.length > 0) {
     selectedSessionId.value = sessionRows[0]?.id ?? ''
@@ -165,6 +224,10 @@ async function loadBasicData() {
   if (!currentProviderId.value && providerRows.length > 0) {
     currentProviderId.value =
       providerRows.find((item) => item.is_default)?.id || providerRows[0]?.id || ''
+  }
+  if (!currentProfileId.value && profileRows.length > 0) {
+    currentProfileId.value =
+      profileRows.find((item) => item.is_default)?.id || profileRows[0]?.id || ''
   }
 
   if (selectedSessionId.value) {
@@ -176,6 +239,14 @@ async function loadBasicData() {
     // 恢复当前会话的模型配置
     if (currentSession?.provider_config_id) {
       currentProviderId.value = currentSession.provider_config_id
+    }
+    if (currentSession?.retrieval_profile_id) {
+      currentProfileId.value = currentSession.retrieval_profile_id
+    } else if (currentSession?.library_id) {
+      const selectedLibrary = libraryRows.find((item) => item.id === currentSession.library_id)
+      if (selectedLibrary) {
+        currentProfileId.value = selectProfileForLibraryType(selectedLibrary.library_type)
+      }
     }
     // 恢复当前会话的显示引用设置
     showCitations.value = currentSession?.show_citations ?? true
@@ -193,10 +264,12 @@ async function newSession() {
     title,
     provider_config_id: currentProviderId.value || null,
     library_id: null,  // 新会话不绑定知识库
+    retrieval_profile_id: currentProfileId.value || null,
     show_citations: true,
   })
   // 保存到本地会话对象中，以便切换时恢复
   created.library_id = null
+  created.retrieval_profile_id = currentProfileId.value || null
   created.show_citations = true
   sessions.value.unshift(created)
   selectedSessionId.value = created.id
@@ -213,6 +286,7 @@ async function selectSession(id: string) {
     const currentSession = sessions.value.find(s => s.id === selectedSessionId.value)
     if (currentSession) {
       currentSession.library_id = currentLibraryId.value
+      currentSession.retrieval_profile_id = currentProfileId.value || null
       currentSession.show_citations = showCitations.value
     }
   }
@@ -223,6 +297,14 @@ async function selectSession(id: string) {
   const targetSession = sessions.value.find(s => s.id === id)
   if (targetSession) {
     currentLibraryId.value = targetSession.library_id || ''
+    if (targetSession.retrieval_profile_id) {
+      currentProfileId.value = targetSession.retrieval_profile_id
+    } else if (targetSession.library_id) {
+      const selectedLibrary = libraries.value.find((item) => item.id === targetSession.library_id)
+      if (selectedLibrary) {
+        currentProfileId.value = selectProfileForLibraryType(selectedLibrary.library_type)
+      }
+    }
     showCitations.value = targetSession.show_citations ?? true
   }
   
@@ -264,6 +346,32 @@ async function handleDeleteSession(id: string) {
   }
 }
 
+function handleLibraryChange() {
+  if (currentLibraryId.value) {
+    const selectedLibrary = libraries.value.find((item) => item.id === currentLibraryId.value)
+    if (selectedLibrary) {
+      const matchedProfileId = selectProfileForLibraryType(selectedLibrary.library_type)
+      if (matchedProfileId) {
+        currentProfileId.value = matchedProfileId
+      }
+    }
+  }
+  if (!selectedSessionId.value) {
+    return
+  }
+  const targetSession = sessions.value.find((item) => item.id === selectedSessionId.value)
+  if (targetSession) {
+    targetSession.library_id = currentLibraryId.value || null
+    targetSession.retrieval_profile_id = currentProfileId.value || null
+  }
+  updateSession(selectedSessionId.value, {
+    library_id: currentLibraryId.value || null,
+    retrieval_profile_id: currentProfileId.value || null,
+  }).catch(() => {
+    // ignore
+  })
+}
+
 async function refreshMessages() {
   if (!selectedSessionId.value) {
     return
@@ -295,10 +403,12 @@ async function send() {
   const currentSession = sessions.value.find(s => s.id === selectedSessionId.value)
   if (currentSession) {
     currentSession.library_id = currentLibraryId.value || null
+    currentSession.retrieval_profile_id = currentProfileId.value || null
     currentSession.show_citations = showCitations.value
     // 同步更新到数据库
     updateSession(selectedSessionId.value, {
       library_id: currentLibraryId.value || null,
+      retrieval_profile_id: currentProfileId.value || null,
       show_citations: showCitations.value,
     }).catch(() => {
       // 忽略更新失败
@@ -309,6 +419,7 @@ async function send() {
     content,
     provider_config_id: currentProviderId.value || null,
     library_ids: currentLibraryId.value ? [currentLibraryId.value] : [],
+    retrieval_profile_id: currentProfileId.value || null,
     top_k: 5,
     use_rerank: useRerank.value,
     show_citations: showCitations.value,
@@ -350,6 +461,21 @@ async function send() {
       ElMessage.error(message)
     },
   )
+}
+
+function handleProfileChange() {
+  if (!selectedSessionId.value) {
+    return
+  }
+  const targetSession = sessions.value.find((item) => item.id === selectedSessionId.value)
+  if (targetSession) {
+    targetSession.retrieval_profile_id = currentProfileId.value || null
+  }
+  updateSession(selectedSessionId.value, {
+    retrieval_profile_id: currentProfileId.value || null,
+  }).catch(() => {
+    // ignore
+  })
 }
 
 onMounted(async () => {

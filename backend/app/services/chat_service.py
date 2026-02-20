@@ -2,19 +2,29 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from collections.abc import Iterator
 from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.db.models import ChatMessage, ChatRoleEnum, ChatSession, KnowledgeLibrary, OwnerTypeEnum, ProviderConfig, RoleEnum, User
-from app.services.kb_service import hybrid_search
+from app.services.kb_service import hybrid_search, is_global_summary_query
 from app.services.provider_service import to_runtime_config
 from app.services.providers.base import ChatRequest, ProviderConfigDTO, RerankRequest
 from app.services.providers.registry import provider_registry
+from app.services.retrieval_profile_service import get_profile_config_by_id
 
 
-def create_session(db: Session, *, user: User, title: str, provider_config_id: UUID | None, library_id: UUID | None) -> ChatSession:
+def create_session(
+    db: Session,
+    *,
+    user: User,
+    title: str,
+    provider_config_id: UUID | None,
+    library_id: UUID | None,
+    retrieval_profile_id: UUID | None,
+) -> ChatSession:
     if provider_config_id:
         provider = (
             db.query(ProviderConfig)
@@ -31,11 +41,14 @@ def create_session(db: Session, *, user: User, title: str, provider_config_id: U
         if library.owner_type == OwnerTypeEnum.private and library.owner_id != user.id and user.role != RoleEnum.admin:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='No access to this library')
 
+    resolved_profile_id, _ = get_profile_config_by_id(db, retrieval_profile_id)
+
     session = ChatSession(
         user_id=user.id,
         title=title,
         provider_config_id=provider_config_id,
         library_id=library_id,
+        retrieval_profile_id=resolved_profile_id,
     )
     db.add(session)
     db.commit()
@@ -84,6 +97,7 @@ def generate_reply(
     content: str,
     provider_config_id: UUID | None,
     library_ids: list[UUID] | None,
+    retrieval_profile_id: UUID | None,
     top_k: int,
     use_rerank: bool,
     show_citations: bool,
@@ -101,7 +115,23 @@ def generate_reply(
     db.refresh(user_message)
 
     available_library_ids = _resolve_libraries(db, user, session.library_id, library_ids)
-    retrieved = hybrid_search(db, library_ids=available_library_ids, query=content, top_k=top_k)
+    resolved_profile_id, retrieval_profile_config = get_profile_config_by_id(
+        db,
+        retrieval_profile_id or session.retrieval_profile_id,
+    )
+    if resolved_profile_id and session.retrieval_profile_id != resolved_profile_id:
+        session.retrieval_profile_id = resolved_profile_id
+        db.add(session)
+        db.commit()
+
+    retrieved = hybrid_search(
+        db,
+        library_ids=available_library_ids,
+        query=content,
+        top_k=top_k,
+        retrieval_profile=retrieval_profile_config,
+    )
+    summary_mode = bool(available_library_ids) and is_global_summary_query(content)
 
     if available_library_ids and not retrieved:
         no_hit_content = _build_no_hit_message()
@@ -145,23 +175,7 @@ def generate_reply(
         .all()
     )
 
-    if retrieved:
-        # 将UUID转换为字符串以便JSON序列化
-        serializable_retrieved = []
-        for item in retrieved:
-            serialized = {}
-            for k, v in item.items():
-                if isinstance(v, UUID):
-                    serialized[k] = str(v)
-                else:
-                    serialized[k] = v
-            serializable_retrieved.append(serialized)
-        system_content = (
-            '你是企业知识助手。请优先使用知识库内容回答，并保持答案准确。'
-            'RAG_CONTEXT=' + json.dumps(serializable_retrieved, ensure_ascii=False)
-        )
-    else:
-        system_content = '你是企业知识助手。在未选择知识库时，可直接基于模型能力回答用户问题。'
+    system_content = _build_system_prompt(retrieved, summary_mode=summary_mode)
 
     messages: list[dict[str, Any]] = [{'role': 'system', 'content': system_content}]
     for msg in history:
@@ -224,6 +238,7 @@ def generate_reply_stream(
     content: str,
     provider_config_id: UUID | None,
     library_ids: list[UUID] | None,
+    retrieval_profile_id: UUID | None,
     top_k: int,
     use_rerank: bool,
     show_citations: bool,
@@ -256,13 +271,24 @@ def generate_reply_stream(
 
     # RAG 检索（传入历史上下文）
     available_library_ids = _resolve_libraries(db, user, session.library_id, library_ids)
+    resolved_profile_id, retrieval_profile_config = get_profile_config_by_id(
+        db,
+        retrieval_profile_id or session.retrieval_profile_id,
+    )
+    if resolved_profile_id and session.retrieval_profile_id != resolved_profile_id:
+        session.retrieval_profile_id = resolved_profile_id
+        db.add(session)
+        db.commit()
+
     retrieved = hybrid_search(
         db,
         library_ids=available_library_ids,
         query=content,
         top_k=top_k,
         history_context=history_context,
+        retrieval_profile=retrieval_profile_config,
     )
+    summary_mode = bool(available_library_ids) and is_global_summary_query(content)
 
     if available_library_ids and not retrieved:
         no_hit_content = _build_no_hit_message()
@@ -306,27 +332,7 @@ def generate_reply_stream(
         if reordered:
             retrieved = reordered
 
-    # 构建 system prompt
-    if retrieved:
-        serializable_retrieved = []
-        for item in retrieved:
-            serialized = {}
-            for k, v in item.items():
-                if isinstance(v, UUID):
-                    serialized[k] = str(v)
-                else:
-                    serialized[k] = v
-            serializable_retrieved.append(serialized)
-        system_content = (
-            '你是企业知识助手。请根据知识库检索结果回答用户问题。\n'
-            '要求：\n'
-            '1. 如果检索结果与问题相关，请基于检索内容直接回答，不要解释检索过程\n'
-            '2. 如果检索结果与问题无关或信息不足，请明确告知用户\n'
-            '3. 回答要简洁准确，避免过度引申\n\n'
-            '知识库检索结果：\n' + json.dumps(serializable_retrieved, ensure_ascii=False, indent=2)
-        )
-    else:
-        system_content = '你是企业知识助手。在未选择知识库时，可直接基于模型能力回答用户问题。'
+    system_content = _build_system_prompt(retrieved, summary_mode=summary_mode)
 
     # 构建消息列表（history 已在前面获取，不包含当前用户消息）
     messages: list[dict[str, Any]] = [{'role': 'system', 'content': system_content}]
@@ -389,6 +395,46 @@ def generate_reply_stream(
         yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
 
     return stream_generator(), []
+
+
+def _build_system_prompt(retrieved: list[dict], *, summary_mode: bool) -> str:
+    if not retrieved:
+        return '你是企业知识助手。在未选择知识库时，可直接基于模型能力回答用户问题。'
+
+    serializable_retrieved = _serialize_retrieved_context(retrieved)
+    context_json = json.dumps(serializable_retrieved, ensure_ascii=False)
+    if summary_mode:
+        return (
+            '你是企业知识助手。当前问题属于“全盘总结/概述”类任务。\n'
+            '请严格遵循：\n'
+            '1. 必须综合所有检索片段归纳，不得只依据最高分片段\n'
+            '2. 优先提炼主线、结构、关键事实，再给精炼总结\n'
+            '3. 若证据有冲突或不足，要明确指出并说明不确定性\n\n'
+            '知识库检索结果：\n' + json.dumps(serializable_retrieved, ensure_ascii=False, indent=2) + '\n'
+            'RAG_CONTEXT=' + context_json
+        )
+    return (
+        '你是企业知识助手。请根据知识库检索结果回答用户问题。\n'
+        '要求：\n'
+        '1. 如果检索结果与问题相关，请基于检索内容直接回答，不要解释检索过程\n'
+        '2. 如果检索结果与问题无关或信息不足，请明确告知用户\n'
+        '3. 回答要简洁准确，避免过度引申\n\n'
+        '知识库检索结果：\n' + json.dumps(serializable_retrieved, ensure_ascii=False, indent=2) + '\n'
+        'RAG_CONTEXT=' + context_json
+    )
+
+
+def _serialize_retrieved_context(retrieved: list[dict]) -> list[dict]:
+    serializable_retrieved = []
+    for item in retrieved:
+        serialized: dict[str, Any] = {}
+        for key, value in item.items():
+            if isinstance(value, UUID):
+                serialized[key] = str(value)
+            else:
+                serialized[key] = value
+        serializable_retrieved.append(serialized)
+    return serializable_retrieved
 
 
 def _resolve_provider(db: Session, user: User, provider_config_id: UUID | None) -> ProviderConfig:

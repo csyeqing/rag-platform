@@ -10,7 +10,16 @@ class ChatSessionCreateRequest(BaseModel):
     title: str = Field(default='新会话', min_length=1, max_length=200)
     provider_config_id: UUID | None = None
     library_id: UUID | None = None
+    retrieval_profile_id: UUID | None = None
     show_citations: bool = True
+
+
+class ChatSessionUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    provider_config_id: UUID | None = None
+    library_id: UUID | None = None
+    retrieval_profile_id: UUID | None = None
+    show_citations: bool | None = None
 
 
 class ChatSessionResponse(BaseModel):
@@ -19,6 +28,7 @@ class ChatSessionResponse(BaseModel):
     title: str
     provider_config_id: UUID | None
     library_id: UUID | None
+    retrieval_profile_id: UUID | None
     show_citations: bool
     created_at: datetime
     updated_at: datetime
@@ -29,6 +39,7 @@ class ChatMessageCreateRequest(BaseModel):
     stream: bool = True
     provider_config_id: UUID | None = None
     library_ids: list[UUID] | None = None
+    retrieval_profile_id: UUID | None = None
     top_k: int = 5
     use_rerank: bool = False
     show_citations: bool = True

@@ -122,6 +122,10 @@ cp deploy/.env.server.example deploy/.env.server
 - `PATCH /api/chat/sessions/{id}`
 - `POST /api/chat/sessions/{id}/messages`（支持 SSE）
 - `GET /api/chat/sessions/{id}/messages`
+- `GET /api/settings/retrieval-profiles`
+- `POST /api/settings/retrieval-profiles`（管理员）
+- `PUT /api/settings/retrieval-profiles/{id}`（管理员）
+- `DELETE /api/settings/retrieval-profiles/{id}`（管理员）
 
 ## 当前限制
 - 文档解析仅支持 `txt/md/csv`。
@@ -153,3 +157,16 @@ docker compose -f deploy/docker-compose.yml --profile tei up --build
 ## 升级提示
 - 如果你是在旧版本数据库上升级到图谱增强版，请在知识库页面对每个库执行一次“重建图谱”。
 - 如果你从 hash embedding 切到 `bge-m3`，请对每个知识库执行一次“重建索引”，以重算历史 chunk 向量。
+- 如果你升级到了“检索优化配置”版本，请执行一次数据库初始化脚本：
+
+```bash
+cd backend
+python scripts/init_db.py
+```
+
+该步骤会自动补齐 `chat_sessions.retrieval_profile_id` 字段，并创建内置优化配置：
+- `general_default`（通用）
+- `novel_story_cn`（小说/故事）
+- `enterprise_docs`（公司资料）
+- `scientific_paper`（科学论文）
+- `humanities_research`（文科研究论文）

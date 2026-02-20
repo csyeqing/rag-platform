@@ -43,6 +43,12 @@ export interface KnowledgeLibrary {
   id: string
   name: string
   description: string | null
+  library_type:
+    | 'general'
+    | 'novel_story'
+    | 'enterprise_docs'
+    | 'scientific_paper'
+    | 'humanities_paper'
   owner_type: 'private' | 'shared'
   owner_id: string | null
   tags: string[]
@@ -57,6 +63,7 @@ export interface ChatSession {
   title: string
   provider_config_id: string | null
   library_id: string | null
+  retrieval_profile_id: string | null
   show_citations: boolean
   created_at: string
   updated_at: string
@@ -125,4 +132,50 @@ export interface KnowledgeGraphRebuildResult {
   edge_count: number
   chunk_count: number
   message: string
+}
+
+export interface RetrievalProfileConfig {
+  rag_min_top1_score: number
+  rag_min_support_score: number
+  rag_min_support_count: number
+  rag_min_item_score: number
+  rag_graph_max_terms: number
+  graph_channel_weight: number
+  graph_only_penalty: number
+  vector_semantic_min: number
+  alias_intent_enabled: boolean
+  alias_mining_max_terms: number
+  co_reference_enabled: boolean
+  vector_candidate_multiplier: number
+  keyword_candidate_multiplier: number
+  graph_candidate_multiplier: number
+  fallback_relax_enabled: boolean
+  fallback_top1_relax: number
+  fallback_support_relax: number
+  fallback_item_relax: number
+  summary_intent_enabled: boolean
+  summary_expand_factor: number
+  summary_min_chunks: number
+  summary_per_file_cap: number
+  summary_min_files: number
+}
+
+export interface RetrievalProfile {
+  id: string
+  profile_key: string
+  name: string
+  profile_type:
+    | 'general'
+    | 'novel_story'
+    | 'enterprise_docs'
+    | 'scientific_paper'
+    | 'humanities_paper'
+  description: string | null
+  config: RetrievalProfileConfig
+  is_default: boolean
+  is_builtin: boolean
+  is_active: boolean
+  created_by: string | null
+  created_at: string
+  updated_at: string
 }

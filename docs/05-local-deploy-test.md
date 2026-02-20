@@ -191,6 +191,7 @@ curl -N -X POST "http://localhost:8000/api/chat/sessions/$SESSION_ID/messages" \
   -d '{
     "content":"什么是RAG？",
     "stream":true,
+    "retrieval_profile_id": null,
     "top_k":5,
     "use_rerank":false,
     "show_citations":true
@@ -205,7 +206,23 @@ curl -N -X POST "http://localhost:8000/api/chat/sessions/$SESSION_ID/messages" \
 3. 若是从旧版本切换到 `bge-m3`：对已有知识库执行“重建索引”（必要），确保历史 chunk 向量完成重算。
 4. `知识图谱` 面板：查看节点/关系统计，执行“重建图谱”，确认节点和关系数量变化。
 5. `AI 聊天` 页面：创建会话、选择模型/知识库、流式回答、引用显示开关，确认引用中可见 `source=graph` 或图谱命中实体。
-6. `系统设置` 页面：本地设置保存；管理员用户管理（创建/禁用/角色切换）。
+6. `AI 聊天` 页面：确认可通过下拉框切换“检索优化配置”（小说/故事、公司资料、科学论文、文科论文等），切换后继续对话仍生效。
+7. `系统设置` 页面：
+   - 普通用户：可查看优化配置列表。
+   - 管理员：可新增/编辑/删除优化配置、设置默认配置；并可继续用户管理（创建/禁用/角色切换）。
+
+## 9.1 升级后数据库补齐（必做）
+
+如果你是从旧版本升级，请执行一次：
+
+```bash
+cd backend
+python scripts/init_db.py
+```
+
+该命令会自动：
+- 补齐 `chat_sessions.retrieval_profile_id` 字段与索引。
+- 创建内置检索优化配置（若不存在）。
 
 ## 10. 常见问题
 

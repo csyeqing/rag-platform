@@ -180,6 +180,12 @@ EMBEDDING_FALLBACK_HASH=false
 4. 自动执行 `python scripts/init_db.py`（创建扩展、建表、默认管理员）
 5. 启动 frontend
 
+如需手动补跑初始化（例如升级后单独执行）：
+
+```bash
+docker compose --env-file deploy/.env.server -f deploy/docker-compose.yml exec -T backend python scripts/init_db.py
+```
+
 ---
 
 ## 6. 部署后验证
@@ -200,6 +206,10 @@ curl http://127.0.0.1:${BACKEND_PORT:-8000}/health
 
 - 前端：`http://<服务器IP或域名>:<FRONTEND_PORT>`
 - 默认管理员：`DEFAULT_ADMIN_USERNAME / DEFAULT_ADMIN_PASSWORD`
+
+部署后请额外验证：
+- 管理员进入“系统设置”可看到并管理检索优化配置（小说/故事、公司资料、科学论文、文科论文等）。
+- 聊天页面可通过下拉框选择检索优化配置，并在会话中持续生效。
 
 ## 7. 常用运维命令
 

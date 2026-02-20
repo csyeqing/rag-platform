@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,7 @@ from app.db.models import (
     KnowledgeEntity,
     KnowledgeFile,
     KnowledgeLibrary,
+    KnowledgeLibraryTypeEnum,
     OwnerTypeEnum,
     RoleEnum,
     User,
@@ -37,17 +40,44 @@ from app.services.graph_service import (
     EN_STOPWORDS,
 )
 from app.services.embedding_service import embed_query, embed_texts
+from app.services.retrieval_profile_service import build_runtime_retrieval_config
 
 SUPPORTED_EXTENSIONS = {'.txt', '.md', '.csv'}
+ALIAS_INTENT_KEYWORDS = {'外号', '绰号', '称呼', '别名', '又名', '俗称', '法号', '叫什么', '怎么叫', '怎么称呼'}
+COREFERENCE_PRONOUNS = {'他', '她', '它', '他们', '她们', '它们', '其', '这个人', '那个人', '这家伙', '那家伙'}
+SUMMARY_INTENT_KEYWORDS = {
+    '总结', '概述', '归纳', '梳理', '总览', '全貌', '整体', '总体', '全盘', '综述',
+    '主要内容', '核心内容', '全书', '整本', '全文', '通篇', '主线', '脉络',
+}
+NICKNAME_HINT_PATTERN = re.compile(r'(?:外号|绰号|别名|又名|俗称|法号|叫做|叫作|称作)')
+NICKNAME_CALL_PATTERN = re.compile(r'(?:叫|称|唤|骂)[^。！？\n]{0,8}[“"「『]?([\u4e00-\u9fff]{2,5})')
+NICKNAME_ADDRESS_PATTERN = re.compile(r'(?:你这|你个|这|那)([\u4e00-\u9fff]{2,4})')
+NICKNAME_QUOTED_PATTERN = re.compile(r'[“"「『]([\u4e00-\u9fff]{2,5})[”"」』]')
+NICKNAME_TOKEN_BLACKLIST = {
+    '师父', '师兄', '师弟', '徒弟', '外号', '别名', '称呼', '名字', '身份', '问题', '答案',
+    '这个', '那个', '这些', '那些', '一个', '一种', '事情', '东西', '这里', '那里',
+}
+ALLOWED_LIBRARY_TYPES = {item.value for item in KnowledgeLibraryTypeEnum}
 
 
-def create_library(db: Session, user: User, *, name: str, description: str | None, owner_type: str, tags: list[str], root_path: str | None) -> KnowledgeLibrary:
+def create_library(
+    db: Session,
+    user: User,
+    *,
+    name: str,
+    description: str | None,
+    library_type: str | None,
+    owner_type: str,
+    tags: list[str],
+    root_path: str | None,
+) -> KnowledgeLibrary:
     try:
         requested_owner = OwnerTypeEnum(owner_type)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='owner_type must be private or shared') from exc
     if requested_owner == OwnerTypeEnum.shared and user.role != RoleEnum.admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Only admin can create shared library')
+    normalized_library_type = _normalize_library_type(library_type)
 
     final_root = _resolve_library_root(root_path, user.id, requested_owner)
     final_root.mkdir(parents=True, exist_ok=True)
@@ -55,6 +85,7 @@ def create_library(db: Session, user: User, *, name: str, description: str | Non
     library = KnowledgeLibrary(
         name=name,
         description=description,
+        library_type=normalized_library_type,
         owner_type=requested_owner,
         owner_id=user.id,
         tags=tags,
@@ -85,6 +116,7 @@ def update_library(
     user: User,
     name: str | None,
     description: str | None,
+    library_type: str | None,
     owner_type: str | None,
     tags: list[str] | None,
 ) -> KnowledgeLibrary:
@@ -94,6 +126,8 @@ def update_library(
         library.name = name
     if description is not None:
         library.description = description
+    if library_type is not None:
+        library.library_type = _normalize_library_type(library_type)
     if tags is not None:
         library.tags = tags
 
@@ -199,6 +233,16 @@ def assert_library_access(library: KnowledgeLibrary, user: User, write: bool = F
         return
     if library.owner_id != user.id and user.role != RoleEnum.admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='No access to private library')
+
+
+def _normalize_library_type(value: str | None) -> str:
+    normalized = (value or KnowledgeLibraryTypeEnum.general.value).strip()
+    if normalized not in ALLOWED_LIBRARY_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='library_type must be one of: general, novel_story, enterprise_docs, scientific_paper, humanities_paper',
+        )
+    return normalized
 
 
 def save_uploaded_file(db: Session, *, library: KnowledgeLibrary, uploaded_file: UploadFile) -> KnowledgeFile:
@@ -386,12 +430,23 @@ def hybrid_search(
     query: str,
     top_k: int = 5,
     history_context: list[str] | None = None,
+    retrieval_profile: dict | None = None,
 ) -> list[dict]:
     if not library_ids:
         return []
 
     settings = get_settings()
-    query_embedding = embed_query(query)
+    runtime_config = build_runtime_retrieval_config(retrieval_profile, settings)
+    summary_mode = bool(runtime_config.get('summary_intent_enabled', True)) and is_global_summary_query(query)
+    summary_expand_factor = max(1, min(int(runtime_config.get('summary_expand_factor', 3)), 8))
+    summary_min_chunks = max(4, min(int(runtime_config.get('summary_min_chunks', 8)), 24))
+    effective_top_k = max(top_k, summary_min_chunks if summary_mode else top_k)
+    if summary_mode:
+        effective_top_k = max(effective_top_k, top_k * summary_expand_factor)
+
+    vector_multiplier = max(2, min(int(runtime_config.get('vector_candidate_multiplier', 4)), 20))
+    keyword_multiplier = max(2, min(int(runtime_config.get('keyword_candidate_multiplier', 4)), 20))
+    graph_multiplier = max(2, min(int(runtime_config.get('graph_candidate_multiplier', 5)), 24))
 
     # 获取知识库中所有实体，用于查询扩展
     all_entities = (
@@ -413,21 +468,33 @@ def hybrid_search(
                     entities_by_alias.setdefault(alias_norm, []).append(entity)
     
     # 提取查询中的实体
-    query_entities = extract_entities_from_text(query, max_entities=10)
+    query_entities = _extract_entities_for_search(query, limit=10)
     
     # 从历史对话中提取实体，用于增强当前查询
     history_entities: list[str] = []
     if history_context:
         for hist_msg in history_context[-4:]:  # 最近4条消息
-            extracted = extract_entities_from_text(hist_msg, max_entities=5)
-            history_entities.extend(extracted)
-        history_entities = list(set(history_entities))[:15]  # 去重，最多15个
+            extracted = _extract_entities_for_search(hist_msg, limit=6)
+            history_entities = _merge_entities_preserve_order(history_entities, extracted, limit=15)
+
+    context_entities = _select_context_entities(
+        query,
+        query_entities=query_entities,
+        history_entities=history_entities,
+        enable_coreference=bool(runtime_config.get('co_reference_enabled', True)),
+        enable_alias_intent=bool(runtime_config.get('alias_intent_enabled', True)),
+    )
+    query_for_embedding = _build_contextual_query(query, context_entities)
+    query_embedding = embed_query(query_for_embedding)
     
     # 合并当前查询实体和历史实体
-    all_entities_for_search = list(set(query_entities + history_entities))
+    all_entities_for_search = _merge_entities_preserve_order(query_entities, history_entities, limit=20)
+    all_entities_for_search = _merge_entities_preserve_order(all_entities_for_search, context_entities, limit=22)
     
     # 构建扩展查询词：原始查询 + 实体名 + 别名
     all_query_terms = [query]
+    if query_for_embedding != query:
+        all_query_terms.append(query_for_embedding)
     for qe in all_entities_for_search:
         qe_norm = normalize_entity(qe)
         if not qe_norm:
@@ -464,7 +531,7 @@ def hybrid_search(
         .join(KnowledgeFile, Chunk.file_id == KnowledgeFile.id)
         .filter(Chunk.library_id.in_(library_ids))
         .order_by(vector_distance_expr)
-        .limit(max(top_k * 2, 10))
+        .limit(max(top_k * vector_multiplier, effective_top_k * 2, 16))
         .all()
     )
 
@@ -476,22 +543,39 @@ def hybrid_search(
             db.query(Chunk, KnowledgeFile.filename)
             .join(KnowledgeFile, Chunk.file_id == KnowledgeFile.id)
             .filter(Chunk.library_id.in_(library_ids), or_(*keyword_filters))
-            .limit(max(top_k * 2, 10))
+            .limit(max(top_k * keyword_multiplier, effective_top_k * 2, 16))
             .all()
         )
 
     graph_expansion = expand_query_terms_by_graph(
         db,
         library_ids=library_ids,
-        query=query,
-        max_terms=max(6, min(int(settings.rag_graph_max_terms), 24)),
+        query=query_for_embedding,
+        max_terms=max(6, min(int(runtime_config.get('rag_graph_max_terms', 12)), 24)),
     )
     graph_terms = graph_expansion.get('expanded_terms', [])
     graph_matches = graph_expansion.get('matched_entities', [])
-    # 也将图谱扩展词加入检索
-    all_search_terms = list(set(keyword_queries + graph_terms))
+
+    alias_mined_terms: list[str] = []
+    if bool(runtime_config.get('alias_intent_enabled', True)) and _is_alias_intent_query(query):
+        anchor_entity_terms = _merge_entities_preserve_order(graph_matches, all_entities_for_search, limit=12)
+        alias_mined_terms = _mine_alias_terms_from_entity_chunks(
+            db,
+            library_ids=library_ids,
+            entity_terms=anchor_entity_terms,
+            max_terms=max(0, min(int(runtime_config.get('alias_mining_max_terms', 8)), 24)),
+        )
+        if alias_mined_terms:
+            graph_terms = _merge_entities_preserve_order(
+                graph_terms,
+                alias_mined_terms,
+                limit=int(runtime_config.get('rag_graph_max_terms', 12)) * 2,
+            )
+
+    # 图谱通道仅使用图谱扩展词，避免与 keyword 通道重复放大噪声
+    all_search_terms = list(set(graph_terms))
     graph_term_set = _normalize_search_terms(all_search_terms)
-    matched_entity_terms = _normalize_search_terms(graph_matches)
+    matched_entity_terms = _normalize_search_terms(_merge_entities_preserve_order(graph_matches, context_entities, limit=16))
     graph_filters = [Chunk.content.ilike(f'%{term}%') for term in all_search_terms if term and len(term.strip()) >= 2]
     graph_candidates = []
     if graph_filters:
@@ -499,7 +583,7 @@ def hybrid_search(
             db.query(Chunk, KnowledgeFile.filename)
             .join(KnowledgeFile, Chunk.file_id == KnowledgeFile.id)
             .filter(Chunk.library_id.in_(library_ids), or_(*graph_filters))
-            .limit(max(top_k * 3, 12))
+            .limit(max(top_k * graph_multiplier, effective_top_k * 3, 20))
             .all()
         )
 
@@ -545,7 +629,16 @@ def hybrid_search(
         key = str(chunk.id)
         graph_overlap = _term_hit_ratio(chunk.content, graph_term_set)
         entity_overlap = _term_hit_ratio(chunk.content, matched_entity_terms)
-        score = _score_sparse_candidate(rank, graph_overlap, entity_boost=entity_overlap, channel_weight=0.9)
+        base_keyword_overlap = _term_hit_ratio(chunk.content, keyword_term_set)
+        score = _score_sparse_candidate(
+            rank,
+            graph_overlap,
+            entity_boost=entity_overlap,
+            channel_weight=float(runtime_config.get('graph_channel_weight', 0.65)),
+        )
+        if base_keyword_overlap == 0.0 and entity_overlap == 0.0:
+            # 只命中图谱扩展词但没命中原问题词/实体时，降权避免伪命中
+            score = round(score * float(runtime_config.get('graph_only_penalty', 0.55)), 6)
         if key in merged:
             merged[key]['score'] = score_merge(float(merged[key]['score']), score)
             merged[key]['source'] = summarize_graph_sources([str(merged[key]['source']), 'graph'])
@@ -565,7 +658,26 @@ def hybrid_search(
             )
 
     ordered = sorted(merged.values(), key=lambda item: item['score'], reverse=True)
-    return _finalize_retrieval_hits(ordered, top_k=top_k)
+    hits = _finalize_retrieval_hits(
+        ordered,
+        top_k=effective_top_k,
+        runtime_config=runtime_config,
+        summary_mode=summary_mode,
+    )
+    if hits:
+        return hits
+
+    if not bool(runtime_config.get('fallback_relax_enabled', True)):
+        return []
+
+    relaxed_runtime = _build_relaxed_runtime_config(runtime_config)
+    return _finalize_retrieval_hits(
+        ordered,
+        top_k=effective_top_k,
+        runtime_config=relaxed_runtime,
+        summary_mode=summary_mode,
+        allow_lenient_summary=True,
+    )
 
 
 def _serialize_chunk_result(
@@ -593,6 +705,175 @@ def _serialize_chunk_result(
         'graph_overlap': round(float(graph_overlap), 6),
         'entity_overlap': round(float(entity_overlap), 6),
     }
+
+
+def _merge_entities_preserve_order(primary: list[str], secondary: list[str], *, limit: int = 20) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for source in (primary, secondary):
+        for item in source:
+            cleaned = str(item).strip()
+            norm = normalize_entity(cleaned)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            merged.append(cleaned)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def _extract_entities_for_search(text: str, *, limit: int = 10) -> list[str]:
+    entities = extract_entities_from_text(text, max_entities=limit)
+    if len(entities) >= limit:
+        return entities[:limit]
+
+    for token in jieba.cut_for_search(text):
+        token = token.strip()
+        norm = normalize_entity(token)
+        if len(norm) < 2 or len(norm) > 8:
+            continue
+        if norm in EN_STOPWORDS or norm in ZH_STOPWORDS:
+            continue
+        entities = _merge_entities_preserve_order(entities, [token], limit=limit)
+        if len(entities) >= limit:
+            break
+    return entities
+
+
+def _is_alias_intent_query(query: str) -> bool:
+    normalized = normalize_entity(query)
+    return any(keyword in query or keyword in normalized for keyword in ALIAS_INTENT_KEYWORDS)
+
+
+def is_global_summary_query(query: str) -> bool:
+    if not query:
+        return False
+    normalized = normalize_entity(query)
+    if any(keyword in query or keyword in normalized for keyword in SUMMARY_INTENT_KEYWORDS):
+        return True
+    # 常见问法：请整体介绍X/完整梳理X
+    if re.search(r'(整体|完整|全面|系统).{0,4}(介绍|梳理|说明|总结)', query):
+        return True
+    return False
+
+
+def _contains_coreference_pronoun(query: str) -> bool:
+    return any(token in query for token in COREFERENCE_PRONOUNS)
+
+
+def _select_context_entities(
+    query: str,
+    *,
+    query_entities: list[str],
+    history_entities: list[str],
+    enable_coreference: bool = True,
+    enable_alias_intent: bool = True,
+) -> list[str]:
+    context_entities: list[str] = []
+    recent_history = list(reversed(history_entities[-4:]))
+
+    if enable_coreference and _contains_coreference_pronoun(query):
+        context_entities = _merge_entities_preserve_order(context_entities, recent_history, limit=4)
+
+    if enable_alias_intent and _is_alias_intent_query(query):
+        context_entities = _merge_entities_preserve_order(context_entities, recent_history, limit=5)
+
+    if not query_entities and recent_history:
+        context_entities = _merge_entities_preserve_order(context_entities, recent_history[:2], limit=5)
+
+    return context_entities
+
+
+def _build_contextual_query(query: str, context_entities: list[str]) -> str:
+    if not context_entities:
+        return query
+    query_entities = {normalize_entity(item) for item in _extract_entities_for_search(query, limit=8)}
+    suffix_terms = [term for term in context_entities if normalize_entity(term) not in query_entities]
+    suffix = ' '.join(suffix_terms[:3]).strip()
+    if not suffix:
+        return query
+    return f'{query} {suffix}'.strip()
+
+
+def _is_valid_nickname_term(token: str) -> bool:
+    norm = normalize_entity(token)
+    if len(norm) < 2 or len(norm) > 5:
+        return False
+    if not re.fullmatch(r'[\u4e00-\u9fff]{2,5}', norm):
+        return False
+    if norm in EN_STOPWORDS or norm in ZH_STOPWORDS or norm in NICKNAME_TOKEN_BLACKLIST:
+        return False
+    if any(bad in norm for bad in ('外号', '别名', '称呼', '名字')):
+        return False
+    return True
+
+
+def _extract_nickname_candidates(text: str) -> list[str]:
+    if not text:
+        return []
+
+    candidates: list[str] = []
+
+    if NICKNAME_HINT_PATTERN.search(text):
+        for match in NICKNAME_CALL_PATTERN.finditer(text):
+            token = match.group(1).strip()
+            if _is_valid_nickname_term(token):
+                candidates.append(token)
+
+    for match in NICKNAME_ADDRESS_PATTERN.finditer(text):
+        token = match.group(1).strip()
+        left_context = text[max(0, match.start() - 8) : match.start()]
+        if not re.search(r'(道|骂|叫|称|唤|喊|喝)', left_context):
+            continue
+        if _is_valid_nickname_term(token):
+            candidates.append(token)
+
+    for match in NICKNAME_QUOTED_PATTERN.finditer(text):
+        token = match.group(1).strip()
+        left_context = text[max(0, match.start() - 10) : match.start()]
+        if not re.search(r'(道|骂|叫|称|唤|喊|喝)', left_context):
+            continue
+        if _is_valid_nickname_term(token):
+            candidates.append(token)
+
+    return _merge_entities_preserve_order(candidates, [], limit=12)
+
+
+def _mine_alias_terms_from_entity_chunks(
+    db: Session,
+    *,
+    library_ids: list[UUID],
+    entity_terms: list[str],
+    max_terms: int = 8,
+) -> list[str]:
+    normalized_entity_terms = _normalize_search_terms(entity_terms, max_terms=10)
+    if not normalized_entity_terms:
+        return []
+
+    filters = [Chunk.content.ilike(f'%{term}%') for term in normalized_entity_terms[:6]]
+    if not filters:
+        return []
+
+    rows = (
+        db.query(Chunk.content)
+        .filter(Chunk.library_id.in_(library_ids), or_(*filters))
+        .limit(120)
+        .all()
+    )
+
+    entity_norm_set = {normalize_entity(item) for item in normalized_entity_terms}
+    counter: Counter[str] = Counter()
+    for (content,) in rows:
+        for candidate in _extract_nickname_candidates(content):
+            norm = normalize_entity(candidate)
+            if norm in entity_norm_set:
+                continue
+            counter[candidate] += 1
+
+    ranked = sorted(counter.items(), key=lambda item: (item[1], len(item[0])), reverse=True)
+    results = [term for term, _ in ranked[:max_terms]]
+    return _merge_entities_preserve_order(results, [], limit=max_terms)
 
 
 def _normalize_search_terms(terms: list[str], *, max_terms: int = 28) -> list[str]:
@@ -634,44 +915,175 @@ def _score_sparse_candidate(rank: int, hit_ratio: float, *, entity_boost: float,
     return round(float(channel_weight) * raw_score, 6)
 
 
-def _is_retrieval_hit(candidates: list[dict]) -> bool:
-    settings = get_settings()
+def _is_retrieval_hit(candidates: list[dict], *, runtime_config: dict | None = None) -> bool:
+    runtime_config = runtime_config or build_runtime_retrieval_config(None)
     if not candidates:
         return False
 
+    rag_min_top1_score = float(runtime_config.get('rag_min_top1_score', 0.30))
+    rag_min_support_score = float(runtime_config.get('rag_min_support_score', 0.18))
+    rag_min_support_count = int(runtime_config.get('rag_min_support_count', 2))
+    vector_semantic_min = float(runtime_config.get('vector_semantic_min', 0.12))
+
     top1_score = float(candidates[0].get('score') or 0.0)
-    support_count = sum(1 for item in candidates if float(item.get('score') or 0.0) >= float(settings.rag_min_support_score))
-    if top1_score < float(settings.rag_min_top1_score):
+    support_count = sum(1 for item in candidates if float(item.get('score') or 0.0) >= rag_min_support_score)
+    if top1_score < rag_min_top1_score:
         return False
-    if support_count < int(settings.rag_min_support_count):
+    if support_count < rag_min_support_count and top1_score < rag_min_top1_score + 0.15:
         return False
 
-    lexical_or_graph_signal = any(
-        (
-            float(item.get('keyword_overlap') or 0.0) > 0.0
-            or float(item.get('graph_overlap') or 0.0) > 0.0
-            or float(item.get('entity_overlap') or 0.0) > 0.0
-        )
-        for item in candidates[: max(3, int(settings.rag_min_support_count))]
-    )
-    semantic_signal = float(candidates[0].get('vector_similarity') or 0.0) >= 0.18
-    return lexical_or_graph_signal or semantic_signal
+    window = candidates[: max(3, rag_min_support_count)]
+    lexical_signal = any(float(item.get('keyword_overlap') or 0.0) > 0.0 for item in window)
+    entity_signal = any(float(item.get('entity_overlap') or 0.0) > 0.0 for item in window)
+    graph_signal = any(float(item.get('graph_overlap') or 0.0) > 0.0 for item in window)
+    semantic_signal = float(candidates[0].get('vector_similarity') or 0.0) >= vector_semantic_min
+
+    # 图谱信号必须与实体或语义信号之一同时出现，避免“只靠图谱词”误命中
+    if lexical_signal or entity_signal:
+        return True
+    if graph_signal and semantic_signal:
+        return True
+    return semantic_signal and top1_score >= rag_min_top1_score + 0.08
 
 
-def _finalize_retrieval_hits(ordered: list[dict], *, top_k: int) -> list[dict]:
+def _finalize_retrieval_hits(
+    ordered: list[dict],
+    *,
+    top_k: int,
+    runtime_config: dict | None = None,
+    summary_mode: bool = False,
+    allow_lenient_summary: bool = False,
+) -> list[dict]:
+    runtime_config = runtime_config or build_runtime_retrieval_config(None)
     if not ordered:
         return []
-    settings = get_settings()
-    min_item_score = float(settings.rag_min_item_score)
+    min_item_score = float(runtime_config.get('rag_min_item_score', 0.10))
+    rag_min_support_count = int(runtime_config.get('rag_min_support_count', 2))
     pruned = [item for item in ordered if float(item.get('score') or 0.0) >= min_item_score]
     if not pruned:
         return []
 
-    validation_window = pruned[: max(top_k * 2, int(settings.rag_min_support_count) + 1)]
-    if not _is_retrieval_hit(validation_window):
-        return []
+    validation_window = pruned[: max(top_k * 2, rag_min_support_count + 1)]
+    hit_ok = _is_retrieval_hit(validation_window, runtime_config=runtime_config)
+    if not hit_ok:
+        if not (summary_mode and allow_lenient_summary and _has_summary_signals(validation_window, runtime_config)):
+            return []
 
+    if summary_mode:
+        return _select_diverse_hits(
+            pruned,
+            top_k=top_k,
+            per_file_cap=int(runtime_config.get('summary_per_file_cap', 2)),
+            min_files=int(runtime_config.get('summary_min_files', 3)),
+        )
     return pruned[:top_k]
+
+
+def _build_relaxed_runtime_config(runtime_config: dict) -> dict:
+    def clamp_float(value: object, *, fallback: float, lower: float, upper: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = fallback
+        return max(lower, min(upper, parsed))
+
+    top1_relax = clamp_float(runtime_config.get('fallback_top1_relax'), fallback=0.08, lower=0.0, upper=0.30)
+    support_relax = clamp_float(runtime_config.get('fallback_support_relax'), fallback=0.06, lower=0.0, upper=0.30)
+    item_relax = clamp_float(runtime_config.get('fallback_item_relax'), fallback=0.04, lower=0.0, upper=0.20)
+    relaxed = dict(runtime_config)
+    relaxed['rag_min_top1_score'] = max(0.0, float(runtime_config.get('rag_min_top1_score', 0.30)) - top1_relax)
+    relaxed['rag_min_support_score'] = max(0.0, float(runtime_config.get('rag_min_support_score', 0.18)) - support_relax)
+    relaxed['rag_min_item_score'] = max(0.0, float(runtime_config.get('rag_min_item_score', 0.10)) - item_relax)
+    relaxed['rag_min_support_count'] = max(1, int(runtime_config.get('rag_min_support_count', 2)) - 1)
+    relaxed['vector_semantic_min'] = max(0.0, float(runtime_config.get('vector_semantic_min', 0.12)) - (support_relax * 0.5))
+    return relaxed
+
+
+def _has_summary_signals(candidates: list[dict], runtime_config: dict) -> bool:
+    if not candidates:
+        return False
+    vector_floor = max(0.0, float(runtime_config.get('vector_semantic_min', 0.12)) * 0.8)
+    lexical_hits = sum(
+        1
+        for item in candidates
+        if float(item.get('keyword_overlap') or 0.0) > 0.0 or float(item.get('entity_overlap') or 0.0) > 0.0
+    )
+    semantic_hits = sum(1 for item in candidates if float(item.get('vector_similarity') or 0.0) >= vector_floor)
+    file_span = len({str(item.get('file_id') or item.get('file_name') or '') for item in candidates})
+    avg_score = sum(float(item.get('score') or 0.0) for item in candidates) / max(1, len(candidates))
+    return lexical_hits >= 1 or semantic_hits >= 2 or (file_span >= 2 and avg_score >= float(runtime_config.get('rag_min_item_score', 0.10)))
+
+
+def _select_diverse_hits(
+    candidates: list[dict],
+    *,
+    top_k: int,
+    per_file_cap: int = 2,
+    min_files: int = 3,
+) -> list[dict]:
+    if not candidates:
+        return []
+    per_file_cap = max(1, min(per_file_cap, 6))
+    min_files = max(1, min(min_files, 10))
+
+    buckets: dict[str, list[dict]] = {}
+    for item in candidates:
+        file_key = str(item.get('file_id') or item.get('file_name') or item.get('chunk_id'))
+        buckets.setdefault(file_key, []).append(item)
+
+    sorted_files = sorted(
+        buckets.items(),
+        key=lambda pair: float(pair[1][0].get('score') or 0.0),
+        reverse=True,
+    )
+
+    selected: list[dict] = []
+    used_chunk_ids: set[str] = set()
+    taken_per_file: dict[str, int] = {}
+
+    target_coverage = min(len(sorted_files), min_files, top_k)
+    for file_key, items in sorted_files:
+        if len(selected) >= target_coverage:
+            break
+        candidate = items[0]
+        chunk_key = str(candidate.get('chunk_id'))
+        if chunk_key in used_chunk_ids:
+            continue
+        selected.append(candidate)
+        used_chunk_ids.add(chunk_key)
+        taken_per_file[file_key] = 1
+
+    progress = True
+    while len(selected) < top_k and progress:
+        progress = False
+        for file_key, items in sorted_files:
+            used_count = taken_per_file.get(file_key, 0)
+            if used_count >= per_file_cap:
+                continue
+            if used_count >= len(items):
+                continue
+            candidate = items[used_count]
+            chunk_key = str(candidate.get('chunk_id'))
+            taken_per_file[file_key] = used_count + 1
+            if chunk_key in used_chunk_ids:
+                continue
+            selected.append(candidate)
+            used_chunk_ids.add(chunk_key)
+            progress = True
+            if len(selected) >= top_k:
+                break
+
+    if len(selected) < top_k:
+        for candidate in candidates:
+            chunk_key = str(candidate.get('chunk_id'))
+            if chunk_key in used_chunk_ids:
+                continue
+            selected.append(candidate)
+            used_chunk_ids.add(chunk_key)
+            if len(selected) >= top_k:
+                break
+
+    return selected[:top_k]
 
 
 def _resolve_library_root(root_path: str | None, user_id: UUID, owner_type: OwnerTypeEnum) -> Path:

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
+LibraryType = Literal['general', 'novel_story', 'enterprise_docs', 'scientific_paper', 'humanities_paper']
+
+
 class KnowledgeLibraryCreateRequest(BaseModel):
     name: str = Field(min_length=2, max_length=150)
     description: str | None = None
+    library_type: LibraryType = 'general'
     owner_type: str = 'private'
     tags: list[str] = Field(default_factory=list)
     root_path: str | None = None
@@ -17,6 +22,7 @@ class KnowledgeLibraryCreateRequest(BaseModel):
 class KnowledgeLibraryUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=150)
     description: str | None = None
+    library_type: LibraryType | None = None
     owner_type: str | None = None
     tags: list[str] | None = None
 
@@ -25,6 +31,7 @@ class KnowledgeLibraryResponse(BaseModel):
     id: UUID
     name: str
     description: str | None
+    library_type: LibraryType
     owner_type: str
     owner_id: UUID | None
     tags: list[str]

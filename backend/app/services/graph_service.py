@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 import re
 from uuid import UUID
 
@@ -84,7 +85,7 @@ TITLE_SUFFIXES = {
 }
 
 ALIAS_HINTS = {
-    '又名', '别名', '亦称', '又称', '也称', '也叫', '又叫', '俗称', '简称', '即', '法号', '绰号'
+    '又名', '别名', '亦称', '又称', '也称', '也叫', '又叫', '俗称', '简称', '法号', '绰号'
 }
 ALIAS_SPLIT_PATTERN = re.compile(r'[、,，/|；;和与及或]')
 ALIAS_CONTEXT_PATTERN = re.compile(
@@ -92,7 +93,7 @@ ALIAS_CONTEXT_PATTERN = re.compile(
 )
 ALIAS_INLINE_PATTERN = re.compile(
     r'(?P<left>[\u4e00-\u9fffA-Za-z0-9_\-]{2,24})\s*'
-    r'(?:又名|别名|亦称|又称|也称|也叫|又叫|俗称|简称|即|法号|绰号)\s*'
+    r'(?:又名|别名|亦称|又称|也称|也叫|又叫|俗称|简称|法号|绰号)\s*'
     r'(?P<right>[\u4e00-\u9fffA-Za-z0-9_\-、,，/|；;和与及或]{2,56})'
 )
 RELATION_TYPE_WEIGHTS: dict[str, float] = {
@@ -101,6 +102,11 @@ RELATION_TYPE_WEIGHTS: dict[str, float] = {
     'depends_on': 1.20,
     'causes': 1.00,
     'co_occurs': 0.70,
+}
+GENERIC_ALIAS_BLACKLIST = {
+    '称呼', '外号', '名字', '身份', '人物', '内容', '问题', '答案', '信息', '故事', '章节', '情节',
+    '情况', '东西', '一个', '一种', '这些', '那些', '这个', '那个', '其他', '相关', '方面', '部分',
+    '其中', '这里', '那里', '我们', '你们', '他们',
 }
 
 # 常见姓氏（用于人名匹配）
@@ -149,9 +155,29 @@ def _extract_alias_terms(raw: str) -> list[str]:
             continue
         for token in re.findall(r'[\u4e00-\u9fffA-Za-z0-9_\-]{2,24}', piece):
             token = token.strip()
-            if len(token) >= 2:
+            if _is_alias_like_token(token):
                 terms.append(token)
     return _dedupe_keep_order(terms)
+
+
+def _is_alias_like_token(token: str) -> bool:
+    norm = normalize_entity(token)
+    if len(norm) < 2:
+        return False
+    if norm.isdigit():
+        return False
+    if norm in EN_STOPWORDS or norm in ZH_STOPWORDS or norm in GENERIC_ALIAS_BLACKLIST:
+        return False
+    if len(norm) == 1 and norm in SINGLE_CHAR_BLACKLIST:
+        return False
+    if any(norm.endswith(suffix) for suffix in ENTITY_SUFFIX_BLACKLIST):
+        return False
+    if '的' in norm and len(norm) >= 4:
+        return False
+    if re.fullmatch(r'[\u4e00-\u9fff]+', norm):
+        if len(norm) > 6:
+            return False
+    return True
 
 
 def choose_canonical_alias(candidates: list[str]) -> str:
@@ -624,6 +650,8 @@ def expand_query_terms_by_graph(db: Session, *, library_ids: list[UUID], query: 
             query_norm = normalize_entity(query_entity)
             if not query_norm:
                 continue
+            if len(query_norm) < 3:
+                continue
             for entity in all_entities:
                 aliases = (entity.metadata_json or {}).get('aliases', [])
                 alias_text = ' '.join(str(alias) for alias in aliases if alias)
@@ -657,8 +685,10 @@ def expand_query_terms_by_graph(db: Session, *, library_ids: list[UUID], query: 
         expanded_scores[item.id] = 2.0 + min(float(item.frequency), 100.0) / 100.0
 
     for rel in linked:
+        if rel.relation_type == 'co_occurs' and rel.weight < 2:
+            continue
         relation_factor = RELATION_TYPE_WEIGHTS.get(rel.relation_type, 0.7)
-        edge_gain = relation_factor * max(1.0, float(rel.weight))
+        edge_gain = relation_factor * (1.0 + min(2.0, math.log1p(max(1.0, float(rel.weight)))))
         expanded_scores[rel.source_entity_id] = expanded_scores.get(rel.source_entity_id, 0.0) + edge_gain
         expanded_scores[rel.target_entity_id] = expanded_scores.get(rel.target_entity_id, 0.0) + edge_gain
 
@@ -678,8 +708,9 @@ def expand_query_terms_by_graph(db: Session, *, library_ids: list[UUID], query: 
         expanded_terms.append(item.display_name)
         aliases = (item.metadata_json or {}).get('aliases', [])
         if isinstance(aliases, list):
-            expanded_terms.extend(str(alias) for alias in aliases[:3])
-    expanded_terms = _dedupe_keep_order(expanded_terms)[: max_terms * 2]
+            filtered_aliases = [str(alias) for alias in aliases if _is_alias_like_token(str(alias))]
+            expanded_terms.extend(filtered_aliases[:2])
+    expanded_terms = _dedupe_keep_order([term for term in expanded_terms if _is_alias_like_token(term)])[: max_terms * 2]
     return {'expanded_terms': expanded_terms, 'matched_entities': matched_names}
 
 

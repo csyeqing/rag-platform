@@ -8,6 +8,7 @@ import type {
   KnowledgeLibrary,
   LoginResponse,
   ProviderConfig,
+  RetrievalProfile,
   UserListItem,
   UserMe,
 } from '../types'
@@ -147,6 +148,28 @@ export async function listMessages(sessionId: string): Promise<ChatMessage[]> {
 export async function listUsers(): Promise<UserListItem[]> {
   const { data } = await apiClient.get('/admin/users')
   return data
+}
+
+export async function listRetrievalProfiles(): Promise<RetrievalProfile[]> {
+  const { data } = await apiClient.get('/settings/retrieval-profiles')
+  return data
+}
+
+export async function createRetrievalProfile(payload: Record<string, unknown>): Promise<RetrievalProfile> {
+  const { data } = await apiClient.post('/settings/retrieval-profiles', payload)
+  return data
+}
+
+export async function updateRetrievalProfile(
+  profileId: string,
+  payload: Record<string, unknown>,
+): Promise<RetrievalProfile> {
+  const { data } = await apiClient.put(`/settings/retrieval-profiles/${profileId}`, payload)
+  return data
+}
+
+export async function deleteRetrievalProfile(profileId: string): Promise<void> {
+  await apiClient.delete(`/settings/retrieval-profiles/${profileId}`)
 }
 
 export async function createUser(payload: Record<string, unknown>): Promise<UserListItem> {

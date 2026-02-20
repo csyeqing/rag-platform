@@ -43,6 +43,14 @@ class OwnerTypeEnum(str, enum.Enum):
     shared = 'shared'
 
 
+class KnowledgeLibraryTypeEnum(str, enum.Enum):
+    general = 'general'
+    novel_story = 'novel_story'
+    enterprise_docs = 'enterprise_docs'
+    scientific_paper = 'scientific_paper'
+    humanities_paper = 'humanities_paper'
+
+
 class IngestionTaskTypeEnum(str, enum.Enum):
     sync_directory = 'sync_directory'
     upload = 'upload'
@@ -60,6 +68,14 @@ class ChatRoleEnum(str, enum.Enum):
     system = 'system'
     user = 'user'
     assistant = 'assistant'
+
+
+class RetrievalProfileTypeEnum(str, enum.Enum):
+    general = 'general'
+    novel_story = 'novel_story'
+    enterprise_docs = 'enterprise_docs'
+    scientific_paper = 'scientific_paper'
+    humanities_paper = 'humanities_paper'
 
 
 class User(Base):
@@ -102,6 +118,7 @@ class KnowledgeLibrary(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(150), index=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    library_type: Mapped[str] = mapped_column(String(50), default=KnowledgeLibraryTypeEnum.general.value, index=True)
     owner_type: Mapped[OwnerTypeEnum] = mapped_column(Enum(OwnerTypeEnum), default=OwnerTypeEnum.private)
     owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
@@ -220,6 +237,7 @@ class ChatSession(Base):
     title: Mapped[str] = mapped_column(String(200), default='新会话')
     provider_config_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     library_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    retrieval_profile_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
     show_citations: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -272,3 +290,30 @@ class AuditLog(Base):
     resource_id: Mapped[str] = mapped_column(String(120), index=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RetrievalProfile(Base):
+    __tablename__ = 'retrieval_profiles'
+    __table_args__ = (
+        UniqueConstraint('profile_key', name='uq_retrieval_profiles_key'),
+        Index('ix_retrieval_profiles_is_default', 'is_default'),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    profile_key: Mapped[str] = mapped_column(String(80), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    profile_type: Mapped[RetrievalProfileTypeEnum] = mapped_column(
+        Enum(RetrievalProfileTypeEnum),
+        default=RetrievalProfileTypeEnum.general,
+        index=True,
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

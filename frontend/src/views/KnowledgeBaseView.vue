@@ -9,6 +9,9 @@
       </template>
       <el-table :data="libraries" stripe>
         <el-table-column prop="name" label="名称" min-width="160" />
+        <el-table-column label="类型" width="140">
+          <template #default="{ row }">{{ libraryTypeLabel(row.library_type) }}</template>
+        </el-table-column>
         <el-table-column prop="owner_type" label="归属" width="120" />
         <el-table-column prop="root_path" label="目录" min-width="260" show-overflow-tooltip />
         <el-table-column label="标签" min-width="220">
@@ -43,6 +46,14 @@
     <el-dialog v-model="editDialogVisible" title="编辑知识库" width="600px">
       <div class="grid gap-3">
         <el-input v-model="editForm.name" placeholder="知识库名称" />
+        <el-select v-model="editForm.library_type">
+          <el-option
+            v-for="item in libraryTypeOptions"
+            :key="item.value"
+            :label="item.label"
+            :value="item.value"
+          />
+        </el-select>
         <el-select v-model="editForm.owner_type" :disabled="auth.role !== 'admin'">
           <el-option label="私有" value="private" />
           <el-option label="共享" value="shared" />
@@ -124,6 +135,14 @@
     <el-dialog v-model="createDialogVisible" title="创建知识库" width="600px">
       <div class="grid gap-4">
         <el-input v-model="createForm.name" placeholder="例如：产品文档、客服知识库" />
+        <el-select v-model="createForm.library_type" style="width: 100%">
+          <el-option
+            v-for="item in libraryTypeOptions"
+            :key="item.value"
+            :label="item.label"
+            :value="item.value"
+          />
+        </el-select>
         <el-select v-model="createForm.owner_type" style="width: 100%">
           <el-option label="私有（仅自己可用）" value="private" />
           <el-option v-if="auth.role === 'admin'" label="共享（所有用户可用，管理员创建）" value="shared" />
@@ -244,9 +263,17 @@ const deletingLibraryId = ref('')
 const rebuildingGraph = ref(false)
 const syncResult = ref<{ success: boolean; message: string } | null>(null)
 const rebuildResult = ref<{ success: boolean; message: string } | null>(null)
+const libraryTypeOptions = [
+  { value: 'general', label: '通用文档' },
+  { value: 'novel_story', label: '小说/故事' },
+  { value: 'enterprise_docs', label: '公司资料' },
+  { value: 'scientific_paper', label: '科学论文' },
+  { value: 'humanities_paper', label: '文科论文' },
+]
 
 const createForm = reactive({
   name: '我的知识库',
+  library_type: 'general',
   owner_type: 'private',
   description: '文本类知识集合',
   root_path: '',
@@ -256,6 +283,7 @@ const createTagsText = ref('default')
 const editForm = reactive({
   id: '',
   name: '',
+  library_type: 'general',
   owner_type: 'private',
   description: '',
 })
@@ -271,6 +299,11 @@ function tagsFromText(text: string): string[] {
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+function libraryTypeLabel(value: KnowledgeLibrary['library_type']) {
+  const matched = libraryTypeOptions.find((item) => item.value === value)
+  return matched?.label || value
 }
 
 async function loadLibraries() {
@@ -437,6 +470,7 @@ function openAddFileDialog(row: KnowledgeLibrary) {
 function openEditDialog(row: KnowledgeLibrary) {
   editForm.id = row.id
   editForm.name = row.name
+  editForm.library_type = row.library_type || 'general'
   editForm.owner_type = row.owner_type
   editForm.description = row.description || ''
   editTagsText.value = row.tags.join(',')
@@ -452,6 +486,7 @@ async function submitEdit() {
   try {
     await updateLibrary(editForm.id, {
       name: editForm.name,
+      library_type: editForm.library_type,
       owner_type: editForm.owner_type,
       description: editForm.description,
       tags: tagsFromText(editTagsText.value),

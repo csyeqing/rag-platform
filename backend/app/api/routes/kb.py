@@ -52,6 +52,7 @@ def create_library_endpoint(
         current_user,
         name=payload.name,
         description=payload.description,
+        library_type=payload.library_type,
         owner_type=payload.owner_type,
         tags=payload.tags,
         root_path=payload.root_path,
@@ -62,7 +63,7 @@ def create_library_endpoint(
         resource_type='knowledge_library',
         resource_id=str(library.id),
         user_id=current_user.id,
-        metadata={'owner_type': library.owner_type.value},
+        metadata={'owner_type': library.owner_type.value, 'library_type': library.library_type},
     )
     return _to_library_response(library)
 
@@ -90,6 +91,7 @@ def update_library_endpoint(
         user=current_user,
         name=payload.name,
         description=payload.description,
+        library_type=payload.library_type,
         owner_type=payload.owner_type,
         tags=payload.tags,
     )
@@ -99,7 +101,7 @@ def update_library_endpoint(
         resource_type='knowledge_library',
         resource_id=str(updated.id),
         user_id=current_user.id,
-        metadata={'owner_type': updated.owner_type.value, 'tags': updated.tags},
+        metadata={'owner_type': updated.owner_type.value, 'library_type': updated.library_type, 'tags': updated.tags},
     )
     return _to_library_response(updated)
 
@@ -287,6 +289,7 @@ def _to_library_response(library) -> KnowledgeLibraryResponse:
         id=library.id,
         name=library.name,
         description=library.description,
+        library_type=library.library_type,
         owner_type=library.owner_type.value,
         owner_id=library.owner_id,
         tags=library.tags,
