@@ -11,6 +11,7 @@ class ProviderBase(BaseModel):
     provider_type: str
     endpoint_url: str
     model_name: str
+    context_window_tokens: int = Field(default=131072, ge=1024, le=2000000)
     is_default: bool = False
     capabilities: dict = Field(default_factory=dict)
 
@@ -24,6 +25,7 @@ class ProviderUpdateRequest(BaseModel):
     provider_type: str | None = None
     endpoint_url: str | None = None
     model_name: str | None = None
+    context_window_tokens: int | None = Field(default=None, ge=1024, le=2000000)
     is_default: bool | None = None
     capabilities: dict | None = None
     api_key: str | None = None

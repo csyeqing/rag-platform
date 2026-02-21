@@ -21,6 +21,7 @@
         </el-select>
         <el-input v-model="createForm.endpoint_url" placeholder="端点 URL" />
         <el-input v-model="createForm.model_name" placeholder="模型名称" />
+        <el-input-number v-model="createForm.context_window_tokens" :min="1024" :max="2000000" />
         <el-input v-model="createForm.api_key" show-password type="password" placeholder="API Key" />
         <el-switch v-model="createForm.is_default" active-text="设为默认" />
       </div>
@@ -39,6 +40,7 @@
         <el-table-column prop="provider_type" label="类型" width="170" />
         <el-table-column prop="endpoint_url" label="端点" min-width="240" show-overflow-tooltip />
         <el-table-column prop="model_name" label="模型" width="180" />
+        <el-table-column prop="context_window_tokens" label="上下文上限" width="120" />
         <el-table-column prop="api_key_masked" label="API Key" width="170" />
         <el-table-column label="默认" width="90">
           <template #default="{ row }">
@@ -65,6 +67,7 @@
         </el-select>
         <el-input v-model="editForm.endpoint_url" placeholder="端点 URL" />
         <el-input v-model="editForm.model_name" placeholder="模型名称" />
+        <el-input-number v-model="editForm.context_window_tokens" :min="1024" :max="2000000" />
         <el-input
           v-model="editForm.api_key"
           show-password
@@ -104,6 +107,7 @@ const createForm = reactive({
   provider_type: 'openai',
   endpoint_url: 'https://api.openai.com',
   model_name: 'gpt-4o-mini',
+  context_window_tokens: 131072,
   api_key: '',
   is_default: true,
   capabilities: {
@@ -118,6 +122,7 @@ const editForm = reactive({
   provider_type: 'openai',
   endpoint_url: '',
   model_name: '',
+  context_window_tokens: 131072,
   api_key: '',
   is_default: false,
   capabilities: {
@@ -166,6 +171,7 @@ function openEditDialog(row: ProviderConfig) {
   editForm.provider_type = row.provider_type
   editForm.endpoint_url = row.endpoint_url
   editForm.model_name = row.model_name
+  editForm.context_window_tokens = row.context_window_tokens || 131072
   editForm.api_key = ''
   editForm.is_default = row.is_default
   editForm.capabilities = {
@@ -209,6 +215,7 @@ async function submitEdit() {
       provider_type: editForm.provider_type,
       endpoint_url: editForm.endpoint_url,
       model_name: editForm.model_name,
+      context_window_tokens: editForm.context_window_tokens,
       is_default: editForm.is_default,
       capabilities: editForm.capabilities,
     }

@@ -222,6 +222,18 @@
         <el-form-item label="总结最少文档数">
           <el-input-number v-model="profileForm.config.summary_min_files" :min="1" :max="10" />
         </el-form-item>
+        <el-form-item label="兜底扩展弱命中">
+          <el-switch v-model="profileForm.config.keyword_fallback_expand_on_weak_hits" />
+        </el-form-item>
+        <el-form-item label="兜底最大片段数">
+          <el-input-number v-model="profileForm.config.keyword_fallback_max_chunks" :min="20" :max="800" />
+        </el-form-item>
+        <el-form-item label="兜底最低分数">
+          <el-input-number v-model="profileForm.config.keyword_fallback_min_score" :step="0.01" :min="0" :max="1.5" />
+        </el-form-item>
+        <el-form-item label="兜底扫描上限">
+          <el-input-number v-model="profileForm.config.keyword_fallback_scan_limit" :step="100" :min="200" :max="20000" />
+        </el-form-item>
       </el-form>
 
       <template #footer>
@@ -286,9 +298,9 @@ function makeDefaultConfig(): RetrievalProfileConfig {
     alias_intent_enabled: true,
     alias_mining_max_terms: 8,
     co_reference_enabled: true,
-    vector_candidate_multiplier: 4,
-    keyword_candidate_multiplier: 4,
-    graph_candidate_multiplier: 5,
+    vector_candidate_multiplier: 3,
+    keyword_candidate_multiplier: 3,
+    graph_candidate_multiplier: 4,
     fallback_relax_enabled: true,
     fallback_top1_relax: 0.08,
     fallback_support_relax: 0.06,
@@ -298,6 +310,10 @@ function makeDefaultConfig(): RetrievalProfileConfig {
     summary_min_chunks: 8,
     summary_per_file_cap: 2,
     summary_min_files: 3,
+    keyword_fallback_expand_on_weak_hits: true,
+    keyword_fallback_max_chunks: 240,
+    keyword_fallback_min_score: 0.08,
+    keyword_fallback_scan_limit: 8000,
   }
 }
 

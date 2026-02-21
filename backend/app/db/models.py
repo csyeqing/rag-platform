@@ -100,6 +100,7 @@ class ProviderConfig(Base):
     provider_type: Mapped[ProviderTypeEnum] = mapped_column(Enum(ProviderTypeEnum), index=True)
     endpoint_url: Mapped[str] = mapped_column(String(500))
     model_name: Mapped[str] = mapped_column(String(200))
+    context_window_tokens: Mapped[int] = mapped_column(Integer, default=131072)
     api_key_encrypted: Mapped[str] = mapped_column(Text)
     capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)

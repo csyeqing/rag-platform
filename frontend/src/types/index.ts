@@ -31,6 +31,7 @@ export interface ProviderConfig {
   provider_type: string
   endpoint_url: string
   model_name: string
+  context_window_tokens: number
   is_default: boolean
   capabilities: Record<string, unknown>
   owner_id: string
@@ -158,6 +159,10 @@ export interface RetrievalProfileConfig {
   summary_min_chunks: number
   summary_per_file_cap: number
   summary_min_files: number
+  keyword_fallback_expand_on_weak_hits: boolean
+  keyword_fallback_max_chunks: number
+  keyword_fallback_min_score: number
+  keyword_fallback_scan_limit: number
 }
 
 export interface RetrievalProfile {

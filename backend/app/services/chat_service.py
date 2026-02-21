@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from collections.abc import Iterator
 from uuid import UUID
@@ -14,6 +15,11 @@ from app.services.provider_service import to_runtime_config
 from app.services.providers.base import ChatRequest, ProviderConfigDTO, RerankRequest
 from app.services.providers.registry import provider_registry
 from app.services.retrieval_profile_service import get_profile_config_by_id
+
+DEFAULT_CONTEXT_WINDOW_TOKENS = 131072
+MIN_CONTEXT_WINDOW_TOKENS = 1024
+MAX_CONTEXT_WINDOW_TOKENS = 2000000
+logger = logging.getLogger('app.request')
 
 
 def create_session(
@@ -174,6 +180,14 @@ def generate_reply(
         .order_by(ChatMessage.created_at.asc())
         .all()
     )
+    retrieved = _compress_retrieved_for_context_window(
+        retrieved,
+        context_window_tokens=selected_provider.context_window_tokens,
+        max_tokens=max_tokens,
+        history_messages=history,
+        query=content,
+        summary_mode=summary_mode,
+    )
 
     system_content = _build_system_prompt(retrieved, summary_mode=summary_mode)
 
@@ -197,19 +211,7 @@ def generate_reply(
 
     citations = []
     if show_citations:
-        citations = [
-            {
-                'library_id': str(item['library_id']),
-                'file_id': str(item['file_id']),
-                'file_name': item['file_name'],
-                'chunk_id': str(item['chunk_id']),
-                'score': float(item['score']),
-                'snippet': item['snippet'],
-                'source': item['source'],
-                'matched_entities': item.get('matched_entities', []),
-            }
-            for item in retrieved
-        ]
+        citations = _build_citations(retrieved)
 
     assistant_message = ChatMessage(
         session_id=session.id,
@@ -332,6 +334,14 @@ def generate_reply_stream(
         if reordered:
             retrieved = reordered
 
+    retrieved = _compress_retrieved_for_context_window(
+        retrieved,
+        context_window_tokens=selected_provider.context_window_tokens,
+        max_tokens=max_tokens,
+        history_messages=history,
+        query=content,
+        summary_mode=summary_mode,
+    )
     system_content = _build_system_prompt(retrieved, summary_mode=summary_mode)
 
     # 构建消息列表（history 已在前面获取，不包含当前用户消息）
@@ -350,37 +360,38 @@ def generate_reply_stream(
     # 流式调用 LLM
     def stream_generator() -> Iterator[str]:
         full_content = ''
-        for delta in adapter.chat_stream(
-            ProviderConfigDTO(**runtime),
-            ChatRequest(
-                model=runtime['model_name'],
-                messages=messages,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-            ),
-        ):
-            if delta.delta:
-                full_content += delta.delta
-                chunk = {'type': 'delta', 'delta': delta.delta}
+        stream_error: str | None = None
+        try:
+            for delta in adapter.chat_stream(
+                ProviderConfigDTO(**runtime),
+                ChatRequest(
+                    model=runtime['model_name'],
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                ),
+            ):
+                if delta.delta:
+                    full_content += delta.delta
+                    chunk = {'type': 'delta', 'delta': delta.delta}
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.exception('chat.stream.error session_id=%s', session_id_value)
+            stream_error = str(exc)
+            if not full_content:
+                full_content = '流式响应中断，请稍后重试。'
+                chunk = {'type': 'delta', 'delta': full_content}
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         # 流式结束后保存消息到数据库
         citations = []
         if show_citations:
-            citations = [
-                {
-                    'library_id': str(item['library_id']),
-                    'file_id': str(item['file_id']),
-                    'file_name': item['file_name'],
-                    'chunk_id': str(item['chunk_id']),
-                    'score': float(item['score']),
-                    'snippet': item['snippet'],
-                    'source': item['source'],
-                    'matched_entities': item.get('matched_entities', []),
-                }
-                for item in retrieved
-            ]
+            try:
+                citations = _build_citations(retrieved)
+            except Exception:
+                citations = []
+                logger.exception('chat.stream.citation.error session_id=%s', session_id_value)
 
         assistant_message = ChatMessage(
             session_id=session_id_value,
@@ -388,10 +399,14 @@ def generate_reply_stream(
             content=full_content,
             citations=citations,
         )
-        db.add(assistant_message)
-        db.commit()
+        try:
+            db.add(assistant_message)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception('chat.stream.persist.error session_id=%s', session_id_value)
 
-        done = {'type': 'done', 'citations': citations}
+        done = {'type': 'done', 'citations': citations, 'error': stream_error}
         yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
 
     return stream_generator(), []
@@ -418,10 +433,75 @@ def _build_system_prompt(retrieved: list[dict], *, summary_mode: bool) -> str:
         '要求：\n'
         '1. 如果检索结果与问题相关，请基于检索内容直接回答，不要解释检索过程\n'
         '2. 如果检索结果与问题无关或信息不足，请明确告知用户\n'
-        '3. 回答要简洁准确，避免过度引申\n\n'
+        '3. 对于“数量/名单”问题，只有在片段中出现明确数量或完整名单时，才给出具体数字或完整列表\n'
+        '4. 回答要简洁准确，避免过度引申\n\n'
         '知识库检索结果：\n' + json.dumps(serializable_retrieved, ensure_ascii=False, indent=2) + '\n'
         'RAG_CONTEXT=' + context_json
     )
+
+
+def _compress_retrieved_for_context_window(
+    retrieved: list[dict],
+    *,
+    context_window_tokens: int | None,
+    max_tokens: int,
+    history_messages: list[ChatMessage],
+    query: str,
+    summary_mode: bool,
+) -> list[dict]:
+    if not retrieved:
+        return []
+
+    context_window = _normalize_context_window_tokens(context_window_tokens)
+    response_reserve = min(max(512, int(max_tokens or 0)), int(context_window * 0.45))
+    history_reserve = sum(_estimate_text_tokens(msg.content) for msg in history_messages[-24:])
+    query_reserve = _estimate_text_tokens(query)
+    prompt_overhead = 1800 if summary_mode else 1200
+
+    available_for_retrieval = max(
+        256,
+        context_window - response_reserve - history_reserve - query_reserve - prompt_overhead,
+    )
+    min_keep = 10 if summary_mode else 5
+
+    selected: list[dict] = []
+    used_tokens = 0
+    for item in retrieved:
+        snippet = str(item.get('snippet') or '')
+        file_name = str(item.get('file_name') or '')
+        item_tokens = max(48, _estimate_text_tokens(snippet) + _estimate_text_tokens(file_name) + 40)
+        if selected and used_tokens + item_tokens > available_for_retrieval:
+            break
+        selected.append(item)
+        used_tokens += item_tokens
+
+    if not selected:
+        return retrieved[:min_keep]
+    if len(selected) >= min_keep:
+        return selected
+
+    for item in retrieved[len(selected) :]:
+        selected.append(item)
+        if len(selected) >= min_keep:
+            break
+    return selected
+
+
+def _normalize_context_window_tokens(value: int | None) -> int:
+    try:
+        parsed = int(value) if value is not None else DEFAULT_CONTEXT_WINDOW_TOKENS
+    except (TypeError, ValueError):
+        parsed = DEFAULT_CONTEXT_WINDOW_TOKENS
+    return max(MIN_CONTEXT_WINDOW_TOKENS, min(MAX_CONTEXT_WINDOW_TOKENS, parsed))
+
+
+def _estimate_text_tokens(text: str) -> int:
+    if not text:
+        return 0
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    token_estimate = int((ascii_chars / 4.0) + (non_ascii_chars / 1.6))
+    return max(1, token_estimate)
 
 
 def _serialize_retrieved_context(retrieved: list[dict]) -> list[dict]:
@@ -435,6 +515,29 @@ def _serialize_retrieved_context(retrieved: list[dict]) -> list[dict]:
                 serialized[key] = value
         serializable_retrieved.append(serialized)
     return serializable_retrieved
+
+
+def _build_citations(retrieved: list[dict]) -> list[dict]:
+    citations: list[dict] = []
+    for item in retrieved:
+        chunk_id = item.get('chunk_id')
+        file_id = item.get('file_id')
+        library_id = item.get('library_id')
+        if chunk_id is None or file_id is None or library_id is None:
+            continue
+        citations.append(
+            {
+                'library_id': str(library_id),
+                'file_id': str(file_id),
+                'file_name': str(item.get('file_name') or ''),
+                'chunk_id': str(chunk_id),
+                'score': float(item.get('score') or 0.0),
+                'snippet': str(item.get('snippet') or ''),
+                'source': str(item.get('source') or ''),
+                'matched_entities': item.get('matched_entities', []),
+            }
+        )
+    return citations
 
 
 def _resolve_provider(db: Session, user: User, provider_config_id: UUID | None) -> ProviderConfig:

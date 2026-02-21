@@ -137,6 +137,8 @@ cp deploy/.env.server.example deploy/.env.server
 - `DEFAULT_ADMIN_PASSWORD`
 - `CORS_ORIGINS`
 - `FRONTEND_PORT`（建议 `80`）
+- `BACKEND_IMAGE`（默认 `rag-backend:latest`）
+- `FRONTEND_IMAGE`（默认 `rag-frontend:latest`）
 
 ### 5.3 Embedding 配置
 
@@ -174,7 +176,7 @@ EMBEDDING_FALLBACK_HASH=false
 
 该命令会自动：
 
-1. 构建前后端镜像
+1. 使用 `deploy/.env.server` 中指定的镜像启动服务（默认 `rag-backend:latest` / `rag-frontend:latest`）
 2. 启动 PostgreSQL
 3. 启动 backend 并等待数据库就绪
 4. 自动执行 `python scripts/init_db.py`（创建扩展、建表、默认管理员）
@@ -210,6 +212,7 @@ curl http://127.0.0.1:${BACKEND_PORT:-8000}/health
 部署后请额外验证：
 - 管理员进入“系统设置”可看到并管理检索优化配置（小说/故事、公司资料、科学论文、文科论文等）。
 - 聊天页面可通过下拉框选择检索优化配置，并在会话中持续生效。
+- `curl http://127.0.0.1/api/settings/retrieval-profiles` 不应返回 404（未登录时应返回 401）。
 
 ## 7. 常用运维命令
 

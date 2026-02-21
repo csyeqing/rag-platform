@@ -11,6 +11,7 @@ class ProviderConfigDTO:
     endpoint_url: str
     model_name: str
     api_key: str
+    context_window_tokens: int = 131072
 
 
 @dataclass

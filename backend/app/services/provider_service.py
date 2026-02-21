@@ -19,6 +19,7 @@ def create_provider_config(db: Session, user: User, request: ProviderCreateReque
         provider_type=provider_type,
         endpoint_url=request.endpoint_url,
         model_name=request.model_name,
+        context_window_tokens=request.context_window_tokens,
         api_key_encrypted=encrypt_secret(request.api_key),
         is_default=request.is_default,
         capabilities=request.capabilities,
@@ -44,6 +45,8 @@ def update_provider_config(db: Session, user: User, config: ProviderConfig, requ
         config.endpoint_url = request.endpoint_url
     if request.model_name is not None:
         config.model_name = request.model_name
+    if request.context_window_tokens is not None:
+        config.context_window_tokens = request.context_window_tokens
     if request.capabilities is not None:
         config.capabilities = request.capabilities
     if request.api_key is not None:
@@ -67,6 +70,7 @@ def serialize_provider(config: ProviderConfig) -> dict:
         'provider_type': config.provider_type.value,
         'endpoint_url': config.endpoint_url,
         'model_name': config.model_name,
+        'context_window_tokens': config.context_window_tokens,
         'is_default': config.is_default,
         'capabilities': config.capabilities,
         'owner_id': config.owner_id,
@@ -82,6 +86,7 @@ def to_runtime_config(config: ProviderConfig) -> dict:
         'endpoint_url': config.endpoint_url,
         'model_name': config.model_name,
         'api_key': decrypt_secret(config.api_key_encrypted),
+        'context_window_tokens': config.context_window_tokens,
     }
 
 

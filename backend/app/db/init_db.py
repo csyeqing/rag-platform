@@ -42,4 +42,7 @@ def _ensure_schema_compat(db: Session) -> None:
     db.execute(text('CREATE INDEX IF NOT EXISTS ix_chat_sessions_retrieval_profile_id ON chat_sessions (retrieval_profile_id)'))
     db.execute(text("ALTER TABLE knowledge_libraries ADD COLUMN IF NOT EXISTS library_type VARCHAR(50) NOT NULL DEFAULT 'general'"))
     db.execute(text('CREATE INDEX IF NOT EXISTS ix_knowledge_libraries_library_type ON knowledge_libraries (library_type)'))
+    db.execute(
+        text('ALTER TABLE provider_configs ADD COLUMN IF NOT EXISTS context_window_tokens INTEGER NOT NULL DEFAULT 131072')
+    )
     db.commit()

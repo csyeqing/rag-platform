@@ -23,8 +23,7 @@ services:
       - full
 
   backend:
-    # 使用你之前构建好的镜像名
-    image: backend:latest
+    image: ${BACKEND_IMAGE:-rag-backend:latest}
     container_name: ${PROJECT_NAME:-rag}_backend
     restart: unless-stopped
     depends_on:
@@ -80,7 +79,7 @@ services:
       - full
 
   frontend:
-    image: rag-frontend:latest
+    image: ${FRONTEND_IMAGE:-rag-frontend:latest}
     container_name: ${PROJECT_NAME:-rag}_frontend
     restart: unless-stopped
     depends_on:
